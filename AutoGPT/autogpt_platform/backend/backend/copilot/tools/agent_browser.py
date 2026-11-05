@@ -1,0 +1,1074 @@
+"""Agent-browser tools — multi-step browser automation for the Copilot.
+
+Uses the agent-browser CLI (https://github.com/vercel-labs/agent-browser)
+which runs a local Chromium instance managed by a persistent daemon.
+
+- Runs locally — no cloud account required
+- Full interaction support: click, fill, scroll, login flows, multi-step
+- Session persistence via --session-name: cookies/auth carry across tool calls
+  within the same Copilot session, enabling login → navigate → extract workflows
+- Screenshot with --annotate overlays @ref labels, saved to workspace for user
+- The Claude Agent SDK's multi-turn loop handles orchestration — each tool call
+  is one browser action; the LLM chains them naturally
+
+SSRF protection:
+  Chromium sends every request through backend.util.egress_proxy, which only
+  connects to public addresses and dials the address it checked. That covers
+  what a URL check cannot see: redirects, link clicks, form posts, scripts,
+  subresources and DNS rebinding. URLs given to browser_navigate are also
+  checked up front with validate_url_host so a refusal comes back as a clear
+  error instead of a failed page load.
+
+Requires:
+  npm install -g agent-browser
+  In Docker: system chromium package with AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
+             (set automatically — no `agent-browser install` needed).
+  Locally: run `agent-browser install` to download Chromium.
+"""
+
+import asyncio
+import base64
+import json
+import logging
+import os
+import re
+import shutil
+import tempfile
+from datetime import UTC, datetime
+from typing import Any
+
+from backend.copilot.context import get_workspace_manager
+from backend.copilot.model import ChatSession
+from backend.data.workspace_internal import WORKING_FILE_METADATA
+from backend.util.egress_proxy import egress_proxy_url
+from backend.util.request import validate_url_host
+
+from .base import BaseTool
+from .models import (
+    BrowserActResponse,
+    BrowserNavigateResponse,
+    BrowserScreenshotResponse,
+    ErrorResponse,
+    ToolResponseBase,
+)
+
+logger = logging.getLogger(__name__)
+
+# Per-command timeout (seconds). Navigation + networkidle wait can be slow.
+_CMD_TIMEOUT = 45
+# Accessibility tree can be very large; cap it to keep LLM context manageable.
+_MAX_SNAPSHOT_CHARS = 20_000
+
+# Launch options sent with every command. agent-browser relaunches Chromium
+# when they change, so a single command without them would restart the browser
+# with direct network access. "<-loopback>" stops Chromium sending localhost
+# and link-local requests around the proxy. The proxy carries only TCP: QUIC is
+# switched off here, and a Chromium policy in the backend image keeps WebRTC's
+# UDP from going around it.
+_PROXY_BYPASS = "<-loopback>"
+_CHROMIUM_ARGS = "--disable-quic"
+
+# agent-browser also merges in ~/.agent-browser/config.json and a
+# ./agent-browser.json from its working directory. A file planted at either
+# could load an extension that rewrites the browser's proxy. Given --config it
+# reads that file alone, so it is pointed at an empty one.
+_empty_config_path: str | None = None
+
+
+def _empty_config() -> str:
+    """Path to an empty agent-browser config, recreated if it has gone missing
+    so a cleaned-up /tmp cannot break every later browser command."""
+    global _empty_config_path
+    path = _empty_config_path
+    if path is None or not os.path.exists(path):
+        fd, path = tempfile.mkstemp(prefix="agent-browser-", suffix=".json")
+        with os.fdopen(fd, "w") as f:
+            f.write("{}")
+        _empty_config_path = path
+    return path
+
+
+# agent-browser reads its own options (proxy, executable, profile, ...) from
+# anywhere on its command line; they are lower-case words, some taking
+# "=value", plus -V. Apart from the ones this module passes itself, an argument
+# of that shape came from the model or a web page (a cookie name, say) and
+# could relaunch the browser around the proxy.
+_OWN_OPTIONS = frozenset(
+    {"-i", "-c", "--load", "--json", "--domain", "--path", "--annotate"}
+)
+_OPTION_LIKE = re.compile(r"--?[a-z][a-z-]*(=.*)?|-V", re.DOTALL)
+
+# agent-browser also takes options from AGENT_BROWSER_* variables and the usual
+# proxy variables. Some of them (CDP, provider, auto-connect, extensions, init
+# scripts) attach to or start a browser without the launch options above, so
+# none reach it except the path to the Chromium it should launch.
+_KEPT_AGENT_BROWSER_ENV = frozenset({"AGENT_BROWSER_EXECUTABLE_PATH"})
+_PROXY_ENV = frozenset({"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"})
+
+
+def _agent_browser_env() -> dict[str, str]:
+    return {
+        name: value
+        for name, value in os.environ.items()
+        if (not name.startswith("AGENT_BROWSER_") or name in _KEPT_AGENT_BROWSER_ENV)
+        and name.upper() not in _PROXY_ENV
+    }
+
+
+# ---------------------------------------------------------------------------
+# Subprocess helper
+# ---------------------------------------------------------------------------
+
+
+async def _run(
+    session_name: str,
+    *args: str,
+    timeout: int = _CMD_TIMEOUT,
+) -> tuple[int, str, str]:
+    """Run agent-browser for the given session and return (rc, stdout, stderr).
+
+    Uses both:
+      --session <name>       → isolated Chromium context (no shared history/cookies
+                               with other Copilot sessions — prevents cross-session
+                               browser state leakage)
+      --session-name <name>  → persist cookies/localStorage across tool calls within
+                               the same session (enables login → navigate flows)
+
+    Chromium's traffic goes through the egress proxy (see the module docstring).
+    """
+    if any(_OPTION_LIKE.fullmatch(arg) and arg not in _OWN_OPTIONS for arg in args):
+        return 1, "", "Refused an argument that looks like an agent-browser option."
+    try:
+        proxy = egress_proxy_url()
+    except Exception:
+        logger.exception("[browser] egress proxy failed to start")
+        return 1, "", "The browser's network proxy is unavailable."
+    cmd = [
+        "agent-browser",
+        "--session",
+        session_name,
+        "--session-name",
+        session_name,
+        "--config",
+        _empty_config(),
+        "--proxy",
+        proxy,
+        "--proxy-bypass",
+        _PROXY_BYPASS,
+        "--args",
+        _CHROMIUM_ARGS,
+        *args,
+    ]
+    _touched_sessions.add(session_name)
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=_agent_browser_env(),
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return proc.returncode or 0, stdout.decode(), stderr.decode()
+    except asyncio.TimeoutError:
+        await _reap(proc)
+        return 1, "", f"Command timed out after {timeout}s."
+    except asyncio.CancelledError:
+        # Teardown cancels saves that overrun the drain; the CLI process
+        # they were waiting on must not outlive them.
+        await _reap(proc)
+        raise
+    except FileNotFoundError:
+        return (
+            1,
+            "",
+            "agent-browser is not installed (run: npm install -g agent-browser && agent-browser install).",
+        )
+
+
+async def _reap(proc: asyncio.subprocess.Process | None) -> None:
+    """Kill a CLI process we stopped waiting on so it does not linger in the
+    process table. Best-effort: errors during cleanup are ignored."""
+    if proc is None or proc.returncode is not None:
+        return
+    proc.kill()
+    try:
+        await proc.communicate()
+    except Exception:
+        pass
+
+
+async def _snapshot(session_name: str) -> str:
+    """Return the current page's interactive accessibility tree, truncated."""
+    rc, stdout, stderr = await _run(session_name, "snapshot", "-i", "-c")
+    if rc != 0:
+        return f"[snapshot failed: {stderr[:300]}]"
+    text = stdout.strip()
+    if len(text) > _MAX_SNAPSHOT_CHARS:
+        suffix = "\n\n[Snapshot truncated — use tool:browser_act to navigate further]"
+        keep = max(0, _MAX_SNAPSHOT_CHARS - len(suffix))
+        text = text[:keep] + suffix
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Stateless session helpers — persist / restore browser state across pods
+# ---------------------------------------------------------------------------
+
+# Module-level cache of sessions known to be alive on this pod.
+# Avoids the subprocess probe on every tool call within the same pod.
+_alive_sessions: set[str] = set()
+
+# Every session this pod has sent ANY agent-browser command for. The CLI
+# starts a daemon (and a Chromium tree) on first contact, including a mere
+# `get url` probe, so this is the set that can have left processes behind.
+# Cleared per session by close_browser_daemon at the end of a turn.
+_touched_sessions: set[str] = set()
+
+# Per-session locks to prevent concurrent _ensure_session calls from
+# triggering duplicate _restore_browser_state for the same session.
+# Protected by _session_locks_mutex to ensure setdefault/pop are not
+# interleaved across await boundaries.
+_session_locks: dict[str, asyncio.Lock] = {}
+_session_locks_mutex = asyncio.Lock()
+
+# Workspace filename for persisted browser state (auto-scoped to session).
+# Written as a working file, so the user's file lists leave it out.
+_STATE_FILENAME = "._browser_state.json"
+
+# Maximum concurrent subprocesses during cookie/storage restore.
+_RESTORE_CONCURRENCY = 10
+
+# Maximum cookies to restore per session.  Pathological sites can accumulate
+# thousands of cookies; restoring them all would be slow and is rarely useful.
+_MAX_RESTORE_COOKIES = 100
+
+# Background state saves, per session, so teardown can wait for the ones
+# still running. Holding the task also stops GC collecting it mid-flight.
+_pending_saves: dict[str, set[asyncio.Task[None]]] = {}
+
+# Sessions whose daemon is being closed. A save scheduled now would send
+# `get url` to a daemon that is about to go, or, if it lands after the close,
+# start a new one that nothing will ever stop.
+_closing_sessions: set[str] = set()
+
+# Turn-end teardown budget. Drain plus close must stay under the executor's
+# _CANCEL_GRACE_SECONDS (5s), with room for the rest of the turn's cleanup:
+# past the grace the worker re-cancels the turn task, the teardown never
+# reaps, and the cluster lock is released while it is still running. A save
+# slower than the drain is dropped; the next turn restores from the last one
+# that landed.
+_SAVE_DRAIN_TIMEOUT = 2
+_TURN_END_CLOSE_TIMEOUT = 2
+
+
+def _fire_and_forget_save(
+    session_name: str, user_id: str, session: ChatSession
+) -> None:
+    """Schedule state persistence as a background task (non-blocking).
+
+    State save is already best-effort (errors are swallowed), so running it
+    in the background avoids adding latency to tool responses.
+    """
+    if session_name in _closing_sessions:
+        logger.debug(
+            "[browser] Skipping state save for session %s: closing", session_name
+        )
+        return
+    task = asyncio.create_task(_save_browser_state(session_name, user_id, session))
+    saves = _pending_saves.setdefault(session_name, set())
+    saves.add(task)
+    task.add_done_callback(saves.discard)
+
+
+async def _drain_saves(session_name: str) -> None:
+    """Wait for the session's in-flight saves so the last tool call's state
+    is on disk before the daemon that holds it is closed."""
+    saves = _pending_saves.pop(session_name, set())
+    if not saves:
+        return
+    _, still_running = await asyncio.wait(saves, timeout=_SAVE_DRAIN_TIMEOUT)
+    for task in still_running:
+        task.cancel()
+    if still_running:
+        logger.warning(
+            "[browser] %d state save(s) for session %s did not finish in %ss",
+            len(still_running),
+            session_name,
+            _SAVE_DRAIN_TIMEOUT,
+        )
+
+
+async def _has_local_session(session_name: str) -> bool:
+    """Check if the local agent-browser daemon for this session is running."""
+    rc, _, _ = await _run(session_name, "get", "url", timeout=5)
+    return rc == 0
+
+
+async def _save_browser_state(
+    session_name: str, user_id: str, session: ChatSession
+) -> None:
+    """Persist browser state (cookies, localStorage, URL) to workspace.
+
+    Best-effort: errors are logged but never propagate to the tool response.
+    """
+    try:
+        # Gather state in parallel
+        (
+            (rc_url, url_out, _),
+            (rc_ck, ck_out, _),
+            (rc_ls, ls_out, _),
+        ) = await asyncio.gather(
+            _run(session_name, "get", "url", timeout=10),
+            _run(session_name, "cookies", "get", "--json", timeout=10),
+            _run(session_name, "storage", "local", "--json", timeout=10),
+        )
+
+        state = {
+            "url": url_out.strip() if rc_url == 0 else "",
+            "cookies": (json.loads(ck_out) if rc_ck == 0 and ck_out.strip() else []),
+            "local_storage": (
+                json.loads(ls_out) if rc_ls == 0 and ls_out.strip() else {}
+            ),
+        }
+
+        manager = await get_workspace_manager(user_id, session.session_id)
+        await manager.write_file(
+            content=json.dumps(state).encode("utf-8"),
+            filename=_STATE_FILENAME,
+            mime_type="application/json",
+            overwrite=True,
+            metadata=WORKING_FILE_METADATA,
+        )
+    except Exception:
+        logger.warning(
+            "[browser] Failed to save browser state for session %s",
+            session_name,
+            exc_info=True,
+        )
+
+
+async def _restore_browser_state(
+    session_name: str, user_id: str, session: ChatSession
+) -> bool:
+    """Restore browser state from workspace storage into a fresh daemon.
+
+    Best-effort: errors are logged but never propagate to the tool response.
+    Returns True on success (or no state to restore), False on failure.
+    """
+    try:
+        manager = await get_workspace_manager(user_id, session.session_id)
+
+        file_info = await manager.get_file_info_by_path(_STATE_FILENAME)
+        if file_info is None:
+            return True  # No saved state — first call or never saved
+
+        state_bytes = await manager.read_file(_STATE_FILENAME)
+        state = json.loads(state_bytes.decode("utf-8"))
+
+        url = state.get("url", "")
+        cookies = state.get("cookies", [])
+        local_storage = state.get("local_storage", {})
+
+        # Navigate first — starts daemon + sets the correct origin for cookies
+        if url:
+            # Validate the saved URL to prevent SSRF via stored redirect targets.
+            try:
+                await validate_url_host(url)
+            except ValueError:
+                logger.warning(
+                    "[browser] State restore: blocked SSRF URL %s", url[:200]
+                )
+                return False
+
+            rc, _, stderr = await _run(session_name, "open", url)
+            if rc != 0:
+                logger.warning(
+                    "[browser] State restore: failed to open %s: %s",
+                    url,
+                    stderr[:200],
+                )
+                return False
+            await _run(session_name, "wait", "--load", "load", timeout=15)
+
+        # Restore cookies and localStorage in parallel via asyncio.gather.
+        # Semaphore caps concurrent subprocess spawns so we don't overwhelm the
+        # system when a session has hundreds of cookies.
+        sem = asyncio.Semaphore(_RESTORE_CONCURRENCY)
+
+        # Guard against pathological sites with thousands of cookies.
+        if len(cookies) > _MAX_RESTORE_COOKIES:
+            logger.debug(
+                "[browser] State restore: capping cookies from %d to %d",
+                len(cookies),
+                _MAX_RESTORE_COOKIES,
+            )
+            cookies = cookies[:_MAX_RESTORE_COOKIES]
+
+        async def _set_cookie(c: dict[str, Any]) -> None:
+            name = c.get("name", "")
+            value = c.get("value", "")
+            domain = c.get("domain", "")
+            path = c.get("path", "/")
+            if not (name and domain):
+                return
+            async with sem:
+                rc, _, stderr = await _run(
+                    session_name,
+                    "cookies",
+                    "set",
+                    name,
+                    value,
+                    "--domain",
+                    domain,
+                    "--path",
+                    path,
+                    timeout=5,
+                )
+            if rc != 0:
+                logger.debug(
+                    "[browser] State restore: cookie set failed for %s: %s",
+                    name,
+                    stderr[:100],
+                )
+
+        async def _set_storage(key: str, val: object) -> None:
+            async with sem:
+                rc, _, stderr = await _run(
+                    session_name,
+                    "storage",
+                    "local",
+                    "set",
+                    key,
+                    str(val),
+                    timeout=5,
+                )
+            if rc != 0:
+                logger.debug(
+                    "[browser] State restore: localStorage set failed for %s: %s",
+                    key,
+                    stderr[:100],
+                )
+
+        await asyncio.gather(
+            *[_set_cookie(c) for c in cookies],
+            *[_set_storage(k, v) for k, v in local_storage.items()],
+        )
+
+        return True
+    except Exception:
+        logger.warning(
+            "[browser] Failed to restore browser state for session %s",
+            session_name,
+            exc_info=True,
+        )
+        return False
+
+
+async def _ensure_session(
+    session_name: str, user_id: str, session: ChatSession
+) -> None:
+    """Ensure the local browser daemon has state. Restore from cloud if needed."""
+    if session_name in _alive_sessions:
+        return
+    async with _session_locks_mutex:
+        lock = _session_locks.setdefault(session_name, asyncio.Lock())
+    async with lock:
+        # Double-check after acquiring lock — another coroutine may have restored.
+        if session_name in _alive_sessions:
+            return
+        if await _has_local_session(session_name):
+            _alive_sessions.add(session_name)
+            return
+        if await _restore_browser_state(session_name, user_id, session):
+            _alive_sessions.add(session_name)
+
+
+async def close_browser_daemon(session_name: str) -> bool:
+    """Stop this pod's agent-browser daemon for *session_name* at turn end.
+
+    A daemon is one Chromium process tree, roughly 15 processes and most of
+    a gigabyte, and nothing else ever stops it: ``close_browser_session``
+    runs only on session deletion, from the API server, never on the
+    executor pod that owns the processes. Left alone, every browser turn a
+    pod serves adds a tree that outlives the turn, the session, and the
+    user, until the pod is OOM killed.
+
+    The persisted state file is deliberately kept. Cookies and storage are
+    saved to the workspace after every tool call and ``_ensure_session``
+    restores them on demand, so the next browser turn resumes where this one
+    left off, on whichever pod it lands.
+
+    Returns whether a close was attempted. Best-effort: never raises.
+    """
+    if session_name not in _touched_sessions:
+        return False
+    try:
+        # Inside the try so a cancellation on the mutex still reaches the
+        # finally; a session left in _closing_sessions never saves again.
+        _closing_sessions.add(session_name)
+        _alive_sessions.discard(session_name)
+        async with _session_locks_mutex:
+            _session_locks.pop(session_name, None)
+        # The last tool call's save may still be running. It has to finish
+        # first: it reads the daemon this is about to close, and if it ran
+        # afterwards its `get url` would start a fresh one.
+        await _drain_saves(session_name)
+        rc, _, stderr = await _run(
+            session_name, "close", timeout=_TURN_END_CLOSE_TIMEOUT
+        )
+        if rc != 0:
+            logger.warning(
+                "[browser] close at turn end failed for session %s: %s",
+                session_name,
+                stderr[:200],
+            )
+    except Exception:
+        logger.warning(
+            "[browser] Exception closing daemon for session %s",
+            session_name,
+            exc_info=True,
+        )
+    finally:
+        # `_run` re-adds the session while sending `close`; nothing is
+        # running for it now.
+        _touched_sessions.discard(session_name)
+        _closing_sessions.discard(session_name)
+    return True
+
+
+async def close_browser_session(session_name: str, user_id: str | None = None) -> None:
+    """Clean up a deleted session's stored browser state, and close its
+    browser if this process runs one.
+
+    Deletes ``._browser_state.json`` from workspace storage so cookies and
+    other credentials do not linger after the session is deleted.
+
+    The daemon is closed only for a session in ``_touched_sessions``. For any
+    other session, ``close`` would start a daemon and launch Chromium just to
+    shut them down again.
+
+    Best-effort: errors are logged but never raised.
+    """
+    _alive_sessions.discard(session_name)
+    async with _session_locks_mutex:
+        _session_locks.pop(session_name, None)
+
+    # Delete persisted browser state (cookies, localStorage) from workspace.
+    if user_id:
+        try:
+            manager = await get_workspace_manager(user_id, session_name)
+            file_info = await manager.get_file_info_by_path(_STATE_FILENAME)
+            if file_info is not None:
+                await manager.delete_file(file_info.id)
+        except Exception:
+            logger.debug(
+                "[browser] Failed to delete state file for session %s",
+                session_name,
+                exc_info=True,
+            )
+
+    if session_name not in _touched_sessions:
+        return
+    try:
+        rc, _, stderr = await _run(session_name, "close", timeout=10)
+        if rc != 0:
+            logger.debug(
+                "[browser] close failed for session %s: %s",
+                session_name,
+                stderr[:200],
+            )
+    except Exception:
+        logger.debug(
+            "[browser] Exception closing browser session %s",
+            session_name,
+            exc_info=True,
+        )
+    finally:
+        # After the close, not before: `_run` records the session again
+        # while sending it.
+        _touched_sessions.discard(session_name)
+
+
+# ---------------------------------------------------------------------------
+# Tool: browser_navigate
+# ---------------------------------------------------------------------------
+
+
+class BrowserNavigateTool(BaseTool):
+    """Navigate to a URL and return the page's interactive elements.
+
+    The browser session persists across tool calls within this Copilot session
+    (keyed to session_id), so cookies and auth state carry over. This enables
+    full login flows: navigate to login page → browser_act to fill credentials
+    → browser_act to submit → browser_navigate to the target page.
+    """
+
+    @property
+    def name(self) -> str:
+        return "browser_navigate"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Navigate to a URL in a real browser. Returns accessibility tree with @ref IDs "
+            "for tool:browser_act. Session persists (cookies/auth carry over). "
+            "For static pages, prefer web_fetch. "
+            "For SPAs, elements may load late — use tool:browser_act with wait + tool:browser_screenshot to verify. "
+            "For auth: navigate to login, fill creds and submit with tool:browser_act, then navigate to target."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "HTTP/HTTPS URL to navigate to.",
+                },
+                "wait_for": {
+                    "type": "string",
+                    "enum": ["networkidle", "load", "domcontentloaded"],
+                    "default": "networkidle",
+                    "description": "Navigation completion strategy (default: networkidle).",
+                },
+            },
+            "required": ["url"],
+        }
+
+    @property
+    def requires_auth(self) -> bool:
+        return True
+
+    @property
+    def is_available(self) -> bool:
+        return shutil.which("agent-browser") is not None
+
+    async def _execute(
+        self,
+        user_id: str | None,
+        session: ChatSession,
+        url: str = "",
+        wait_for: str = "networkidle",
+        **kwargs: Any,
+    ) -> ToolResponseBase:
+        """Navigate to *url*, wait for the page to settle, and return a snapshot.
+
+        The snapshot is an accessibility-tree listing of interactive elements.
+        Note: for slow SPAs that never fully idle, the snapshot may reflect a
+        partially-loaded state (the wait is best-effort).
+        """
+        url = url.strip()
+        wait_for = wait_for or "networkidle"
+        session_name = session.session_id
+
+        if not url:
+            return ErrorResponse(
+                message="Please provide a URL to navigate to.",
+                error="missing_url",
+                session_id=session_name,
+            ).from_outside()
+
+        try:
+            await validate_url_host(url)
+        except ValueError as e:
+            return ErrorResponse(
+                message=str(e),
+                error="blocked_url",
+                session_id=session_name,
+            ).from_outside()
+
+        # Restore browser state from cloud if this is a different pod
+        if user_id:
+            await _ensure_session(session_name, user_id, session)
+
+        # Navigate
+        rc, _, stderr = await _run(session_name, "open", url)
+        if rc != 0:
+            logger.warning(
+                "[browser_navigate] open failed for %s: %s", url, stderr[:300]
+            )
+            return ErrorResponse(
+                message="Failed to navigate to URL.",
+                error="navigation_failed",
+                session_id=session_name,
+            ).from_outside()
+
+        # Wait for page to settle (best-effort: some SPAs never reach networkidle)
+        wait_rc, _, wait_err = await _run(session_name, "wait", "--load", wait_for)
+        if wait_rc != 0:
+            logger.warning(
+                "[browser_navigate] wait(%s) failed: %s", wait_for, wait_err[:300]
+            )
+
+        # Get current title and URL in parallel
+        (_, title_out, _), (_, url_out, _) = await asyncio.gather(
+            _run(session_name, "get", "title"),
+            _run(session_name, "get", "url"),
+        )
+
+        snapshot = await _snapshot(session_name)
+
+        result = BrowserNavigateResponse(
+            message=f"Navigated to {url}",
+            url=url_out.strip() or url,
+            title=title_out.strip(),
+            snapshot=snapshot,
+            session_id=session_name,
+        ).from_outside(snapshot, title_out.strip(), url_out.strip() or url)
+
+        # Persist browser state to cloud for cross-pod continuity
+        if user_id:
+            _fire_and_forget_save(session_name, user_id, session)
+
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Tool: browser_act
+# ---------------------------------------------------------------------------
+
+_NO_TARGET_ACTIONS = frozenset({"back", "forward", "reload"})
+_SCROLL_ACTIONS = frozenset({"scroll"})
+_TARGET_ONLY_ACTIONS = frozenset({"click", "dblclick", "hover", "check", "uncheck"})
+_TARGET_VALUE_ACTIONS = frozenset({"fill", "type", "select"})
+# wait <selector|ms>: waits for a DOM element or a fixed delay (e.g. "1000" for 1 s)
+_WAIT_ACTIONS = frozenset({"wait"})
+
+
+class BrowserActTool(BaseTool):
+    """Perform an action on the current browser page and return the updated snapshot.
+
+    Use @ref IDs from the snapshot returned by browser_navigate (e.g. '@e3').
+    The LLM orchestrates multi-step flows by chaining browser_navigate and
+    browser_act calls across turns of the Claude Agent SDK conversation.
+    """
+
+    @property
+    def name(self) -> str:
+        return "browser_act"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Interact with the current browser page using @ref IDs from the snapshot. "
+            "Actions: click, dblclick, fill, type, scroll, hover, press, "
+            "check, uncheck, select, wait, back, forward, reload. "
+            "fill clears field first; type appends. "
+            "wait accepts CSS selector or milliseconds (e.g. '1000'). "
+            "Returns updated snapshot."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "click",
+                        "dblclick",
+                        "fill",
+                        "type",
+                        "scroll",
+                        "hover",
+                        "press",
+                        "check",
+                        "uncheck",
+                        "select",
+                        "wait",
+                        "back",
+                        "forward",
+                        "reload",
+                    ],
+                    "description": "Action to perform.",
+                },
+                "target": {
+                    "type": "string",
+                    "description": "@ref ID (e.g. '@e3'), CSS selector, or text. Required for: click, dblclick, fill, type, hover, check, uncheck, select. For wait: CSS selector or milliseconds string (e.g. '1000').",
+                    "entity": None,
+                },
+                "value": {
+                    "type": "string",
+                    "description": "Text for fill/type, key for press (e.g. 'Enter'), option for select.",
+                },
+                "direction": {
+                    "type": "string",
+                    "enum": ["up", "down", "left", "right"],
+                    "default": "down",
+                    "description": "Scroll direction (default: down).",
+                },
+            },
+            "required": ["action"],
+        }
+
+    @property
+    def requires_auth(self) -> bool:
+        return True
+
+    @property
+    def is_available(self) -> bool:
+        return shutil.which("agent-browser") is not None
+
+    async def _execute(
+        self,
+        user_id: str | None,
+        session: ChatSession,
+        action: str = "",
+        target: str = "",
+        value: str = "",
+        direction: str = "down",
+        **kwargs: Any,
+    ) -> ToolResponseBase:
+        """Perform a browser action and return an updated page snapshot.
+
+        Validates the *action*/*target*/*value* combination, delegates to
+        ``agent-browser``, waits for the page to settle, and returns the
+        accessibility-tree snapshot so the LLM can plan the next step.
+        """
+        action = action.strip()
+        target = target.strip()
+        value = value.strip()
+        direction = direction.strip()
+        session_name = session.session_id
+
+        if not action:
+            return ErrorResponse(
+                message="Please specify an action.",
+                error="missing_action",
+                session_id=session_name,
+            ).from_outside()
+
+        # Build the agent-browser command args
+        if action in _NO_TARGET_ACTIONS:
+            cmd_args = [action]
+
+        elif action in _SCROLL_ACTIONS:
+            cmd_args = ["scroll", direction]
+
+        elif action == "press":
+            if not value:
+                return ErrorResponse(
+                    message="'press' requires a 'value' (key name, e.g. 'Enter').",
+                    error="missing_value",
+                    session_id=session_name,
+                ).from_outside()
+            cmd_args = ["press", value]
+
+        elif action in _TARGET_ONLY_ACTIONS:
+            if not target:
+                return ErrorResponse(
+                    message=f"'{action}' requires a 'target' element.",
+                    error="missing_target",
+                    session_id=session_name,
+                ).from_outside()
+            cmd_args = [action, target]
+
+        elif action in _TARGET_VALUE_ACTIONS:
+            if not target or not value:
+                return ErrorResponse(
+                    message=f"'{action}' requires both 'target' and 'value'.",
+                    error="missing_params",
+                    session_id=session_name,
+                ).from_outside()
+            cmd_args = [action, target, value]
+
+        elif action in _WAIT_ACTIONS:
+            if not target:
+                return ErrorResponse(
+                    message=(
+                        "'wait' requires a 'target': a CSS selector to wait for, "
+                        "or milliseconds as a string (e.g. '1000')."
+                    ),
+                    error="missing_target",
+                    session_id=session_name,
+                ).from_outside()
+            cmd_args = ["wait", target]
+
+        else:
+            return ErrorResponse(
+                message=f"Unsupported action: {action}",
+                error="invalid_action",
+                session_id=session_name,
+            ).from_outside()
+
+        # Restore browser state from cloud if this is a different pod
+        if user_id:
+            await _ensure_session(session_name, user_id, session)
+
+        rc, _, stderr = await _run(session_name, *cmd_args)
+        if rc != 0:
+            logger.warning("[browser_act] %s failed: %s", action, stderr[:300])
+            return ErrorResponse(
+                message=f"Action '{action}' failed.",
+                error="action_failed",
+                session_id=session_name,
+            ).from_outside()
+
+        # Allow the page to settle after interaction (best-effort: SPAs may not idle)
+        settle_rc, _, settle_err = await _run(
+            session_name, "wait", "--load", "networkidle"
+        )
+        if settle_rc != 0:
+            logger.warning(
+                "[browser_act] post-action wait failed: %s", settle_err[:300]
+            )
+
+        snapshot = await _snapshot(session_name)
+        _, url_out, _ = await _run(session_name, "get", "url")
+
+        result = BrowserActResponse(
+            message=f"Performed '{action}'" + (f" on '{target}'" if target else ""),
+            action=action,
+            current_url=url_out.strip(),
+            snapshot=snapshot,
+            session_id=session_name,
+        ).from_outside(snapshot, url_out.strip())
+
+        # Persist browser state to cloud for cross-pod continuity
+        if user_id:
+            _fire_and_forget_save(session_name, user_id, session)
+
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Tool: browser_screenshot
+# ---------------------------------------------------------------------------
+
+
+class BrowserScreenshotTool(BaseTool):
+    """Capture a screenshot of the current browser page and save it to the workspace."""
+
+    @property
+    def name(self) -> str:
+        return "browser_screenshot"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Screenshot the current browser page and save to workspace. "
+            "annotate=true overlays @ref labels on elements. "
+            "IMPORTANT: After calling, you MUST immediately call read_workspace_file with the "
+            "returned file_id to display the image inline."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "annotate": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Overlay @ref labels (default: true).",
+                },
+                "filename": {
+                    "type": "string",
+                    "description": "Workspace filename (default: a new unique name).",
+                },
+            },
+        }
+
+    @property
+    def requires_auth(self) -> bool:
+        return True
+
+    @property
+    def is_available(self) -> bool:
+        return shutil.which("agent-browser") is not None
+
+    async def _execute(
+        self,
+        user_id: str | None,
+        session: ChatSession,
+        annotate: bool | str = True,
+        filename: str = "",
+        **kwargs: Any,
+    ) -> ToolResponseBase:
+        """Capture a PNG screenshot and upload it to the workspace.
+
+        Handles string-to-bool coercion for *annotate* (OpenAI function-call
+        payloads sometimes deliver ``"true"``/``"false"`` as strings).
+        Returns a :class:`BrowserScreenshotResponse` with the workspace
+        ``file_id`` the LLM should pass to ``read_workspace_file``.
+        """
+        raw_annotate = annotate
+        if isinstance(raw_annotate, str):
+            annotate = raw_annotate.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            annotate = bool(raw_annotate)
+        # A chat's workspace refuses a repeated path, so an unnamed capture gets its own.
+        filename = (
+            filename.strip()
+            or f"screenshot-{datetime.now(UTC):%Y%m%d-%H%M%S}-{os.urandom(3).hex()}.png"
+        )
+        session_name = session.session_id
+
+        # Restore browser state from cloud if this is a different pod
+        if user_id:
+            await _ensure_session(session_name, user_id, session)
+
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".png")
+        os.close(tmp_fd)
+        try:
+            cmd_args = ["screenshot"]
+            if annotate:
+                cmd_args.append("--annotate")
+            cmd_args.append(tmp_path)
+
+            rc, _, stderr = await _run(session_name, *cmd_args)
+            if rc != 0:
+                logger.warning("[browser_screenshot] failed: %s", stderr[:300])
+                return ErrorResponse(
+                    message="Failed to take screenshot.",
+                    error="screenshot_failed",
+                    session_id=session_name,
+                ).from_outside()
+
+            with open(tmp_path, "rb") as f:
+                png_bytes = f.read()
+
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass  # Best-effort temp file cleanup; not critical if it fails.
+
+        # Upload to workspace so the user can view it
+        png_b64 = base64.b64encode(png_bytes).decode()
+
+        # Import here to avoid circular deps — workspace_files imports from .models
+        from .workspace_files import WorkspaceWriteResponse, WriteWorkspaceFileTool
+
+        write_resp = await WriteWorkspaceFileTool()._execute(
+            user_id=user_id,
+            session=session,
+            filename=filename,
+            content_base64=png_b64,
+        )
+
+        if not isinstance(write_resp, WorkspaceWriteResponse):
+            logger.warning(
+                f"[browser_screenshot] failed to save {filename}: {write_resp.message}"
+            )
+            return ErrorResponse(
+                message=f"Screenshot taken but failed to save to workspace: {write_resp.message}",
+                error="workspace_write_failed",
+                session_id=session_name,
+            ).from_outside()
+
+        result = BrowserScreenshotResponse(
+            message=f"Screenshot saved to workspace as '{filename}'. Use read_workspace_file with file_id='{write_resp.file_id}' to retrieve it.",
+            file_id=write_resp.file_id,
+            filename=filename,
+            session_id=session_name,
+        ).from_outside()
+
+        # Persist browser state to cloud for cross-pod continuity
+        if user_id:
+            _fire_and_forget_save(session_name, user_id, session)
+
+        return result

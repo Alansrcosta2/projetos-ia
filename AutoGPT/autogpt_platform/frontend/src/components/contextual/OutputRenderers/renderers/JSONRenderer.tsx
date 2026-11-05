@@ -1,0 +1,209 @@
+"use client";
+
+import React, { useState } from "react";
+import {
+  OutputRenderer,
+  OutputMetadata,
+  DownloadContent,
+  CopyContent,
+} from "../types";
+import { ArrowDown01Icon, ArrowRight01Icon } from "@hugeicons/core-free-icons";
+import { Icon } from "@/components/atoms/Icon/Icon";
+
+function canRenderJSON(value: unknown, _metadata?: OutputMetadata): boolean {
+  if (_metadata?.type === "json") {
+    return true;
+  }
+
+  if (typeof value === "object" && value !== null) {
+    return true;
+  }
+
+  if (typeof value === "string") {
+    try {
+      JSON.parse(value);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  return false;
+}
+
+function renderJSON(
+  value: unknown,
+  _metadata?: OutputMetadata,
+): React.ReactNode {
+  let jsonData = value;
+
+  if (typeof value === "string") {
+    try {
+      jsonData = JSON.parse(value);
+    } catch {
+      return null;
+    }
+  }
+
+  return <JSONViewer data={jsonData} />;
+}
+
+function getCopyContentJSON(
+  value: unknown,
+  _metadata?: OutputMetadata,
+): CopyContent | null {
+  const jsonString =
+    typeof value === "string" ? value : JSON.stringify(value, null, 2);
+
+  return {
+    mimeType: "application/json",
+    data: jsonString,
+    alternativeMimeTypes: ["text/plain"],
+    fallbackText: jsonString,
+  };
+}
+
+function getDownloadContentJSON(
+  value: unknown,
+  _metadata?: OutputMetadata,
+): DownloadContent | null {
+  const jsonString =
+    typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  const blob = new Blob([jsonString], { type: "application/json" });
+
+  return {
+    data: blob,
+    filename: _metadata?.filename || "output.json",
+    mimeType: "application/json",
+  };
+}
+
+function isConcatenableJSON(
+  _value: unknown,
+  _metadata?: OutputMetadata,
+): boolean {
+  return true;
+}
+
+export const jsonRenderer: OutputRenderer = {
+  name: "JSONRenderer",
+  priority: 20,
+  canRender: canRenderJSON,
+  render: renderJSON,
+  getCopyContent: getCopyContentJSON,
+  getDownloadContent: getDownloadContentJSON,
+  isConcatenable: isConcatenableJSON,
+};
+
+function JSONViewer({ data }: { data: any }) {
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+
+  const toggleCollapse = (key: string) => {
+    setCollapsed((prev) => ({ ...prev, [key]: !prev[key] }));
+  };
+
+  const renderValue = (value: any, key: string = ""): React.ReactNode => {
+    if (value === null)
+      return <span className="text-foreground-tertiary">null</span>;
+    if (value === undefined)
+      return <span className="text-foreground-tertiary">undefined</span>;
+
+    if (typeof value === "boolean") {
+      return <span className="text-info-foreground">{value.toString()}</span>;
+    }
+
+    if (typeof value === "number") {
+      return <span className="text-success">{value}</span>;
+    }
+
+    if (typeof value === "string") {
+      return (
+        <span className="text-orange-foreground">&quot;{value}&quot;</span>
+      );
+    }
+
+    if (Array.isArray(value)) {
+      const isCollapsed = collapsed[key];
+      const itemCount = value.length;
+
+      if (itemCount === 0) {
+        return <span className="text-foreground-tertiary">[]</span>;
+      }
+
+      return (
+        <div className="inline-block">
+          <button
+            onClick={() => toggleCollapse(key)}
+            className="inline-flex items-center rounded px-1 hover:bg-surface-hover"
+          >
+            {isCollapsed ? (
+              <Icon icon={ArrowRight01Icon} className="size-3" />
+            ) : (
+              <Icon icon={ArrowDown01Icon} className="size-3" />
+            )}
+            <span className="ml-1 text-foreground-tertiary">
+              Array({itemCount})
+            </span>
+          </button>
+          {!isCollapsed && (
+            <div className="mt-1 ml-4">
+              {value.map((item, index) => (
+                <div key={index} className="flex">
+                  <span className="mr-2 text-foreground-tertiary">
+                    {index}:
+                  </span>
+                  {renderValue(item, `${key}[${index}]`)}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    if (typeof value === "object") {
+      const isCollapsed = collapsed[key];
+      const keys = Object.keys(value);
+
+      if (keys.length === 0) {
+        return <span className="text-foreground-tertiary">{"{}"}</span>;
+      }
+
+      return (
+        <div className="inline-block">
+          <button
+            onClick={() => toggleCollapse(key)}
+            className="inline-flex items-center rounded px-1 hover:bg-surface-hover"
+          >
+            {isCollapsed ? (
+              <Icon icon={ArrowRight01Icon} className="size-3" />
+            ) : (
+              <Icon icon={ArrowDown01Icon} className="size-3" />
+            )}
+            <span className="ml-1 text-foreground-tertiary">Object</span>
+          </button>
+          {!isCollapsed && (
+            <div className="mt-1 ml-4">
+              {keys.map((objKey) => (
+                <div key={objKey} className="flex">
+                  <span className="mr-2 text-brand-hover">
+                    &quot;{objKey}&quot;:
+                  </span>
+                  {renderValue(value[objKey], `${key}.${objKey}`)}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    return <span className="text-foreground-tertiary">{String(value)}</span>;
+  };
+
+  return (
+    <div className="overflow-x-auto rounded-md bg-surface-hover p-3 font-mono text-body">
+      {renderValue(data, "root")}
+    </div>
+  );
+}

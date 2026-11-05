@@ -1,0 +1,73 @@
+import asyncio
+from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING, Any, Union
+
+from expiringdict import ExpiringDict
+
+if TYPE_CHECKING:
+    from redis.asyncio import Redis as AsyncRedis
+    from redis.asyncio.cluster import RedisCluster as AsyncRedisCluster
+    from redis.asyncio.lock import Lock as AsyncRedisLock
+
+    AsyncRedisLike = Union[AsyncRedis, AsyncRedisCluster]
+
+
+class AsyncRedisKeyedMutex:
+    """
+    This class provides a mutex that can be locked and unlocked by a specific key,
+    using Redis as a distributed locking provider.
+
+    Every acquisition must get its own redis-py ``Lock``. A ``Lock`` keeps its
+    owner token on the object, and ``release()`` clears it only after the Redis
+    round-trip, so a ``Lock`` shared between coroutines lets a releasing holder
+    wipe the token of the waiter that just took the key. That waiter can then
+    never release it, and the key stays held until its TTL.
+
+    The latest lock per key is kept in an ExpiringDict, so ``release`` and
+    ``release_all_locks`` can find it without leaking memory.
+    """
+
+    def __init__(self, redis: "AsyncRedisLike", timeout: int | None = 60):
+        self.redis = redis
+        self.timeout = timeout
+        self.locks: dict[Any, "AsyncRedisLock"] = ExpiringDict(
+            max_len=6000, max_age_seconds=self.timeout
+        )
+        self.locks_lock = asyncio.Lock()
+
+    @asynccontextmanager
+    async def locked(self, key: Any):
+        lock = await self.acquire(key)
+        try:
+            yield
+        finally:
+            if (await lock.locked()) and (await lock.owned()):
+                await lock.release()
+
+    async def acquire(
+        self, key: Any, *, blocking_timeout: float | None = None
+    ) -> "AsyncRedisLock":
+        """Acquire a lock, raising TimeoutError if its blocking timeout expires."""
+        lock = self.redis.lock(str(key), self.timeout, thread_local=False)
+        if not await lock.acquire(blocking_timeout=blocking_timeout):
+            raise TimeoutError("Timed out waiting for a Redis lock")
+        # No await between taking the key and registering it: a caller that
+        # wraps this in wait_for and cleans up with release(key) must always
+        # find a lock it was cancelled after taking.
+        self.locks[key] = lock
+        return lock
+
+    async def release(self, key: Any):
+        if (
+            (lock := self.locks.get(key))
+            and (await lock.locked())
+            and (await lock.owned())
+        ):
+            await lock.release()
+
+    async def release_all_locks(self):
+        """Call this on process termination to ensure all locks are released"""
+        async with self.locks_lock:
+            for lock in list(self.locks.values()):
+                if (await lock.locked()) and (await lock.owned()):
+                    await lock.release()

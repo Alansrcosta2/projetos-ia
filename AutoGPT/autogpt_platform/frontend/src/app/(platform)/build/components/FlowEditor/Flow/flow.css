@@ -1,0 +1,14 @@
+/* Reset default xyflow handle styles so custom Phosphor icon handles render correctly */
+.react-flow__handle {
+  background: transparent;
+  width: auto;
+  height: auto;
+  border: 0;
+  position: relative;
+  transform: none;
+}
+
+/* The dot grid reads its builder role, at xyflow's default dot colour. */
+.react-flow {
+  --xy-background-pattern-color: rgb(var(--color-builder-grid));
+}

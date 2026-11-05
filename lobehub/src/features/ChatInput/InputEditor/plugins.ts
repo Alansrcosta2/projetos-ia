@@ -1,0 +1,45 @@
+import {
+  ReactCodemirrorPlugin,
+  ReactCodePlugin,
+  ReactHRPlugin,
+  ReactLinkHighlightPlugin,
+  ReactListPlugin,
+  ReactMathPlugin,
+  ReactMentionPlugin,
+  ReactVirtualBlockPlugin,
+} from '@lobehub/editor';
+import { type Editor } from '@lobehub/editor/react';
+
+import { ReactActionTagPlugin } from './ActionTag';
+import { ReactLocalFileTagPlugin } from './LocalFileTag';
+import { ReactReferDocumentPlugin } from './ReferDocument';
+import { ReactReferTopicPlugin } from './ReferTopic';
+
+type EditorPlugins = NonNullable<Parameters<typeof Editor>[0]['plugins']>;
+
+interface CreateChatInputRichPluginsOptions {
+  linkPlugin?: EditorPlugins[number] | false;
+  mathPlugin?: EditorPlugins[number] | false;
+}
+
+export const CHAT_INPUT_EMBED_PLUGINS: EditorPlugins = [
+  ReactActionTagPlugin,
+  ReactReferTopicPlugin,
+  ReactReferDocumentPlugin,
+  ReactLocalFileTagPlugin,
+  ReactMentionPlugin,
+];
+
+export const createChatInputRichPlugins = ({
+  linkPlugin = ReactLinkHighlightPlugin,
+  mathPlugin = ReactMathPlugin,
+}: CreateChatInputRichPluginsOptions = {}): EditorPlugins => [
+  ReactListPlugin,
+  ReactCodePlugin,
+  ReactCodemirrorPlugin,
+  ReactHRPlugin,
+  ...(linkPlugin ? [linkPlugin] : []),
+  ReactVirtualBlockPlugin,
+  ...(mathPlugin ? [mathPlugin] : []),
+  ...CHAT_INPUT_EMBED_PLUGINS,
+];

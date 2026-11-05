@@ -1,0 +1,54 @@
+"use client";
+
+import { cn } from "@/lib/utils";
+import * as React from "react";
+import { useScrollableTabs } from "../context";
+
+interface Props extends React.ButtonHTMLAttributes<HTMLButtonElement> {
+  value: string;
+}
+
+export const ScrollableTabsTrigger = React.forwardRef<HTMLButtonElement, Props>(
+  function ScrollableTabsTrigger(
+    { className, value, children, ...props },
+    ref,
+  ) {
+    const { activeValue, scrollToSection } = useScrollableTabs();
+    const elementRef = React.useRef<HTMLButtonElement>(null);
+    const isActive = activeValue === value;
+
+    function handleClick(e: React.MouseEvent<HTMLButtonElement>) {
+      e.preventDefault();
+      e.stopPropagation();
+      scrollToSection(value);
+      props.onClick?.(e);
+    }
+
+    return (
+      <button
+        type="button"
+        ref={(node) => {
+          if (typeof ref === "function") ref(node);
+          else if (ref) ref.current = node;
+          // eslint-disable-next-line @typescript-eslint/ban-ts-comment -- elementRef is a read-only RefObject; the callback ref fills it
+          // @ts-ignore
+          elementRef.current = node;
+        }}
+        data-scrollable-tab-trigger
+        data-value={value}
+        data-slot="scrollable-tabs-trigger"
+        onClick={handleClick}
+        className={cn(
+          "relative inline-flex items-center justify-center px-3 py-3 font-sans text-body leading-6 font-medium whitespace-nowrap text-foreground-body transition-all focus-visible:ring-2 focus-visible:ring-border-strong focus-visible:ring-offset-2 focus-visible:outline-none disabled:pointer-events-none disabled:opacity-50",
+          isActive && "text-brand-hover",
+          className,
+        )}
+        {...props}
+      >
+        {children}
+      </button>
+    );
+  },
+);
+
+ScrollableTabsTrigger.displayName = "ScrollableTabsTrigger";

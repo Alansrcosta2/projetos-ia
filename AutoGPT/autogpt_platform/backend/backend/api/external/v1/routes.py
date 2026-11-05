@@ -1,0 +1,537 @@
+import logging
+import urllib.parse
+from typing import Annotated, Any, Optional, Sequence
+
+from fastapi import APIRouter, Body, HTTPException, Security, status
+from prisma.enums import AgentExecutionStatus, APIKeyPermission
+from pydantic import BaseModel, Field
+from typing_extensions import TypedDict
+
+import backend.api.features.store.cache as store_cache
+import backend.api.features.store.db as store_db
+import backend.api.features.store.model as store_model
+import backend.blocks
+from backend.api.external.middleware import require_auth, require_permission
+from backend.api.external.rate_limit import EXECUTION_LIMIT, READ_LIMIT
+from backend.blocks._base import AnyBlockSchema
+from backend.copilot.capabilities.block_meta import is_graph_only_block
+from backend.copilot.rate_limit import UserPaywalledError, enforce_payment_paywall
+from backend.data import execution as execution_db
+from backend.data import graph as graph_db
+from backend.data import user as user_db
+from backend.data.auth.api_key import APIKeyInfo
+from backend.data.auth.base import APIAuthorizationInfo
+from backend.data.block import BlockInput, CompletedBlockOutput
+from backend.data.execution import ExecutionContext, ExecutionTrigger
+from backend.executor.direct_block_execution import (
+    DirectBlockExecutionBusyError,
+    DirectBlockExecutionLimitError,
+    DirectBlockExecutionSlot,
+    DirectBlockExecutionTimeoutError,
+    claim_direct_block_execution_slot,
+    run_block_off_loop,
+)
+from backend.executor.utils import (
+    add_graph_execution,
+    charge_for_direct_block_execution,
+)
+from backend.integrations.webhooks.graph_lifecycle_hooks import before_graph_activate
+from backend.util.exceptions import InsufficientBalanceError
+from backend.util.settings import Settings
+from backend.util.timezone_utils import get_user_timezone_or_utc
+
+from .integrations import integrations_router
+from .tools import tools_router
+
+settings = Settings()
+logger = logging.getLogger(__name__)
+
+v1_router = APIRouter()
+
+# Each integrations route declares its own tier in ``integrations.py``: the
+# reads take READ_LIMIT, while credential writes and the two OAuth hops (which
+# call out to a provider) take EXECUTION_LIMIT. A router-level dependency
+# cannot express that split — FastAPI would AND it with every route's own
+# dependency, so a write would be counted against both budgets.
+v1_router.include_router(integrations_router)
+v1_router.include_router(tools_router)
+
+
+class UserInfoResponse(BaseModel):
+    id: str
+    name: Optional[str]
+    email: str
+    timezone: str = Field(
+        description="The user's last known timezone (e.g. 'Europe/Amsterdam'), "
+        "or 'not-set' if not set"
+    )
+
+
+@v1_router.get(
+    path="/me",
+    tags=["user", "meta"],
+    dependencies=[
+        READ_LIMIT,
+    ],
+)
+async def get_user_info(
+    auth: APIAuthorizationInfo = Security(
+        require_permission(APIKeyPermission.IDENTITY)
+    ),
+) -> UserInfoResponse:
+    user = await user_db.get_user_by_id(auth.user_id)
+
+    return UserInfoResponse(
+        id=user.id,
+        name=user.name,
+        email=user.email,
+        timezone=user.timezone,
+    )
+
+
+@v1_router.get(
+    path="/blocks",
+    tags=["blocks"],
+    dependencies=[
+        Security(require_permission(APIKeyPermission.READ_BLOCK)),
+        READ_LIMIT,
+    ],
+)
+async def get_graph_blocks() -> Sequence[dict[Any, Any]]:
+    blocks = [block() for block in backend.blocks.get_blocks().values()]
+    return [b.to_dict() for b in blocks if not b.disabled]
+
+
+@v1_router.post(
+    path="/blocks/{block_id}/execute",
+    tags=["blocks"],
+    dependencies=[
+        Security(require_permission(APIKeyPermission.EXECUTE_BLOCK)),
+        EXECUTION_LIMIT,
+    ],
+)
+async def execute_graph_block(
+    block_id: str,
+    data: BlockInput,
+    auth: APIAuthorizationInfo = Security(
+        require_permission(APIKeyPermission.EXECUTE_BLOCK)
+    ),
+) -> CompletedBlockOutput:
+    # Sync block exec doesn't pass through ``add_graph_execution`` (no
+    # central enqueue), and external API routes use API-key auth instead
+    # of JWT so the JWT-based dep doesn't apply either. Inline strict
+    # gate with the same fail-closed (503-on-blip) posture as the dep —
+    # consistent with chat / internal block / internal graph routes.
+    await enforce_payment_paywall(auth.user_id)
+
+    obj = backend.blocks.get_block(block_id)
+    if not obj:
+        raise HTTPException(status_code=404, detail=f"Block #{block_id} not found.")
+    if obj.disabled:
+        raise HTTPException(status_code=403, detail=f"Block #{block_id} is disabled.")
+    # The blocks CoPilot won't run standalone need a workflow around them here too;
+    # one shared predicate keeps the two boundaries from drifting apart.
+    if is_graph_only_block(obj):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Block #{block_id} can only run inside a workflow.",
+        )
+
+    user = await user_db.get_user_by_id(auth.user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    try:
+        slot = claim_direct_block_execution_slot(auth.user_id)
+    except DirectBlockExecutionBusyError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)
+        ) from e
+    except DirectBlockExecutionLimitError as e:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e)
+        ) from e
+
+    with slot:
+        return await _run_direct_block(obj, data, auth, user.timezone, slot)
+
+
+async def _run_direct_block(
+    obj: AnyBlockSchema,
+    data: BlockInput,
+    auth: APIAuthorizationInfo,
+    user_timezone: str,
+    slot: DirectBlockExecutionSlot,
+) -> CompletedBlockOutput:
+    try:
+        await charge_for_direct_block_execution(
+            user_id=auth.user_id, block=obj, input_data=data, source="external"
+        )
+    except InsufficientBalanceError as e:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED, detail=str(e)
+        ) from e
+
+    # Direct block execution has no graph; build a minimal ExecutionContext
+    # carrying the caller's identity, the key's org/team scope and the
+    # timezone, so blocks that depend on those get correct data.
+    execution_context = ExecutionContext(
+        user_id=auth.user_id,
+        user_timezone=get_user_timezone_or_utc(user_timezone),
+        organization_id=auth.organization_id,
+        team_id=auth.team_id_restriction,
+    )
+
+    try:
+        return await run_block_off_loop(
+            obj.execute(data, execution_context=execution_context), slot
+        )
+    except DirectBlockExecutionTimeoutError as e:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail=str(e)
+        ) from e
+
+
+@v1_router.post(
+    path="/graphs",
+    tags=["graphs"],
+    status_code=201,
+    dependencies=[
+        Security(
+            require_permission(
+                APIKeyPermission.WRITE_GRAPH, APIKeyPermission.WRITE_LIBRARY
+            )
+        ),
+        EXECUTION_LIMIT,
+    ],
+)
+async def create_graph(
+    graph: graph_db.Graph,
+    auth: APIAuthorizationInfo = Security(
+        require_permission(APIKeyPermission.WRITE_GRAPH, APIKeyPermission.WRITE_LIBRARY)
+    ),
+) -> graph_db.GraphModel:
+    """
+    Create a new agent graph.
+
+    The graph will be validated and assigned a new ID.
+    It is automatically added to the user's library.
+    """
+    from backend.api.features.library import db as library_db
+
+    graph_model = graph_db.make_graph_model(graph, auth.user_id)
+    graph_model.reassign_ids(user_id=auth.user_id, reassign_graph_id=True)
+    graph_model.validate_graph(for_run=False)
+
+    # Validate BEFORE persisting so a credential issue can't leave the graph
+    # and library agent half-saved.
+    graph_model = await before_graph_activate(graph_model, user_id=auth.user_id)
+
+    # Dual-write org/team tenancy to BOTH the graph and the library entry,
+    # matching the internal create route. An org- or team-scoped API key must
+    # not leave the graph untenanted while its library row is org-tagged.
+    await graph_db.create_graph(
+        graph_model,
+        user_id=auth.user_id,
+        organization_id=auth.organization_id,
+        team_id=auth.team_id_restriction,
+    )
+    await library_db.create_library_agent(
+        graph_model,
+        auth.user_id,
+        organization_id=auth.organization_id,
+        team_id=auth.team_id_restriction,
+    )
+
+    return graph_model
+
+
+@v1_router.post(
+    path="/graphs/{graph_id}/execute/{graph_version}",
+    tags=["graphs"],
+    dependencies=[
+        EXECUTION_LIMIT,
+    ],
+)
+async def execute_graph(
+    graph_id: str,
+    graph_version: int,
+    node_input: Annotated[dict[str, Any], Body(..., embed=True, default_factory=dict)],
+    auth: APIAuthorizationInfo = Security(
+        require_permission(APIKeyPermission.EXECUTE_GRAPH)
+    ),
+) -> dict[str, Any]:
+    # Strict route-level paywall: 503 on tier-lookup failure (rather
+    # than fail-open via the deep gate inside add_graph_execution).
+    # Consistent with the JWT-gated internal graph-execute route.
+    await enforce_payment_paywall(auth.user_id)
+
+    # Attribute the execution to the API key's org when the key is org-scoped,
+    # so a key issued for org A doesn't get billed/attributed to the user's
+    # default (personal) org. A team-restricted key pins the execution to
+    # that team; otherwise team stays org-home (None). Only fall back to the
+    # user's default org/team when the key carries no org.
+    org_id: str | None
+    team_id: str | None
+    if auth.organization_id:
+        org_id, team_id = auth.organization_id, auth.team_id_restriction
+    else:
+        # Best-effort: a DB hiccup here must not collapse a subsequent
+        # UserPaywalledError into 400 via the broad except below.
+        from backend.api.features.orgs.db import get_user_default_team
+
+        try:
+            org_id, team_id = await get_user_default_team(auth.user_id)
+        except Exception:
+            logger.warning(
+                "get_user_default_team failed for external execute",
+                exc_info=True,
+            )
+            org_id, team_id = None, None
+
+    try:
+        graph_exec = await add_graph_execution(
+            graph_id=graph_id,
+            user_id=auth.user_id,
+            inputs=node_input,
+            graph_version=graph_version,
+            organization_id=org_id,
+            team_id=team_id,
+            trigger=ExecutionTrigger.API,
+            trigger_ref=auth.id if isinstance(auth, APIKeyInfo) else auth.type,
+        )
+        return {"id": graph_exec.id}
+    except UserPaywalledError:
+        # Defence-in-depth: even though the strict gate above catches
+        # paywall before this point, leave the re-raise so the broad
+        # ``except Exception`` doesn't accidentally collapse a future
+        # deep-gate hit into HTTP 400.
+        raise
+    except Exception as e:
+        msg = str(e).encode().decode("unicode_escape")
+        raise HTTPException(status_code=400, detail=msg)
+
+
+class ExecutionNode(TypedDict):
+    node_id: str
+    input: Any
+    output: dict[str, Any]
+
+
+class GraphExecutionResult(TypedDict):
+    execution_id: str
+    status: str
+    nodes: list[ExecutionNode]
+    output: Optional[list[dict[str, str]]]
+
+
+@v1_router.get(
+    path="/graphs/{graph_id}/executions/{graph_exec_id}/results",
+    tags=["graphs"],
+    dependencies=[
+        READ_LIMIT,
+    ],
+)
+async def get_graph_execution_results(
+    graph_id: str,
+    graph_exec_id: str,
+    auth: APIAuthorizationInfo = Security(
+        require_permission(APIKeyPermission.READ_GRAPH)
+    ),
+) -> GraphExecutionResult:
+    graph_exec = await execution_db.get_graph_execution(
+        user_id=auth.user_id,
+        execution_id=graph_exec_id,
+        include_node_executions=True,
+    )
+    if not graph_exec:
+        raise HTTPException(
+            status_code=404, detail=f"Graph execution #{graph_exec_id} not found."
+        )
+
+    if not await graph_db.get_graph(
+        graph_id=graph_exec.graph_id,
+        version=graph_exec.graph_version,
+        user_id=auth.user_id,
+    ):
+        raise HTTPException(status_code=404, detail=f"Graph #{graph_id} not found.")
+
+    return GraphExecutionResult(
+        execution_id=graph_exec_id,
+        status=graph_exec.status.value,
+        nodes=[
+            ExecutionNode(
+                node_id=node_exec.node_id,
+                input=node_exec.input_data.get("value", node_exec.input_data),
+                output={k: v for k, v in node_exec.output_data.items()},
+            )
+            for node_exec in graph_exec.node_executions
+        ],
+        output=(
+            [
+                {name: value}
+                for name, values in graph_exec.outputs.items()
+                for value in values
+            ]
+            if graph_exec.status == AgentExecutionStatus.COMPLETED
+            else None
+        ),
+    )
+
+
+##############################################
+############### Store Endpoints ##############
+##############################################
+
+
+@v1_router.get(
+    path="/store/agents",
+    tags=["store"],
+    dependencies=[
+        Security(require_auth),  # data is public; auth required as anti-DDoS
+        READ_LIMIT,
+    ],
+    response_model=store_model.StoreAgentsResponse,
+)
+async def get_store_agents(
+    featured: bool = False,
+    creator: str | None = None,
+    sorted_by: store_db.StoreAgentsSortOptions | None = None,
+    search_query: str | None = None,
+    category: str | None = None,
+    page: int = 1,
+    page_size: int = 20,
+) -> store_model.StoreAgentsResponse:
+    """
+    Get a paginated list of agents from the store with optional filtering and sorting.
+
+    Args:
+        featured: Filter to only show featured agents
+        creator: Filter agents by creator username
+        sorted_by: Sort agents by "runs", "rating", "name", or "updated_at"
+        search_query: Search agents by name, subheading and description
+        category: Filter agents by category
+        page: Page number for pagination (default 1)
+        page_size: Number of agents per page (default 20)
+
+    Returns:
+        StoreAgentsResponse: Paginated list of agents matching the filters
+    """
+    if page < 1:
+        raise HTTPException(status_code=422, detail="Page must be greater than 0")
+
+    if page_size < 1:
+        raise HTTPException(status_code=422, detail="Page size must be greater than 0")
+
+    agents = await store_cache.get_cached_store_agents(
+        featured=featured,
+        creator=creator,
+        sorted_by=sorted_by,
+        search_query=search_query,
+        category=category,
+        page=page,
+        page_size=page_size,
+    )
+    return agents
+
+
+@v1_router.get(
+    path="/store/agents/{username}/{agent_name}",
+    tags=["store"],
+    dependencies=[
+        Security(require_auth),  # data is public; auth required as anti-DDoS
+        READ_LIMIT,
+    ],
+    response_model=store_model.StoreAgentDetails,
+)
+async def get_store_agent(
+    username: str,
+    agent_name: str,
+) -> store_model.StoreAgentDetails:
+    """
+    Get details of a specific store agent by username and agent name.
+
+    Args:
+        username: Creator's username
+        agent_name: Name/slug of the agent
+
+    Returns:
+        StoreAgentDetails: Detailed information about the agent
+    """
+    username = urllib.parse.unquote(username).lower()
+    agent_name = urllib.parse.unquote(agent_name).lower()
+    agent = await store_cache.get_cached_agent_details(
+        username=username, agent_name=agent_name
+    )
+    return agent
+
+
+@v1_router.get(
+    path="/store/creators",
+    tags=["store"],
+    dependencies=[
+        Security(require_auth),  # data is public; auth required as anti-DDoS
+        READ_LIMIT,
+    ],
+    response_model=store_model.CreatorsResponse,
+)
+async def get_store_creators(
+    featured: bool = False,
+    search_query: str | None = None,
+    sorted_by: store_db.StoreCreatorsSortOptions | None = None,
+    page: int = 1,
+    page_size: int = 20,
+) -> store_model.CreatorsResponse:
+    """
+    Get a paginated list of store creators with optional filtering and sorting.
+
+    Args:
+        featured: Filter to only show featured creators
+        search_query: Search creators by profile description
+        sorted_by: Sort by "agent_rating", "agent_runs", or "num_agents"
+        page: Page number for pagination (default 1)
+        page_size: Number of creators per page (default 20)
+
+    Returns:
+        CreatorsResponse: Paginated list of creators matching the filters
+    """
+    if page < 1:
+        raise HTTPException(status_code=422, detail="Page must be greater than 0")
+
+    if page_size < 1:
+        raise HTTPException(status_code=422, detail="Page size must be greater than 0")
+
+    creators = await store_cache.get_cached_store_creators(
+        featured=featured,
+        search_query=search_query,
+        sorted_by=sorted_by,
+        page=page,
+        page_size=page_size,
+    )
+    return creators
+
+
+@v1_router.get(
+    path="/store/creators/{username}",
+    tags=["store"],
+    dependencies=[
+        Security(require_auth),  # data is public; auth required as anti-DDoS
+        READ_LIMIT,
+    ],
+    response_model=store_model.CreatorDetails,
+)
+async def get_store_creator(
+    username: str,
+) -> store_model.CreatorDetails:
+    """
+    Get details of a specific store creator by username.
+
+    Args:
+        username: Creator's username
+
+    Returns:
+        CreatorDetails: Detailed information about the creator
+    """
+    username = urllib.parse.unquote(username).lower()
+    creator = await store_cache.get_cached_creator_details(username=username)
+    return creator

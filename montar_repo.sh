@@ -30,12 +30,22 @@ for r in "${repos[@]}"; do
   if [ -d "${BASE_DIR}/${name}" ] && [ -n "$(ls -A "${BASE_DIR}/${name}" 2>/dev/null)" ]; then
     echo "SKIP clone ${name}"
   else
-    if git clone --depth 1 --single-branch --no-tags "https://github.com/${r}.git" "${BASE_DIR}/${name}"; then
-      echo "OK clone ${name}"
-    else
-      echo "FALHA clone ${r}"
+    ok=0
+    for try in 1 2 3; do
+      rm -rf "${BASE_DIR}/${name}"
+      echo "Clonando ${name} (tentativa ${try})..."
+      if git clone --depth 1 --single-branch --no-tags "https://github.com/${r}.git" "${BASE_DIR}/${name}"; then
+        ok=1
+        break
+      fi
+      echo "FALHA clone ${r} (tentativa ${try})"
+      sleep 5
+    done
+    if [ "${ok}" -ne 1 ]; then
+      echo "DESISTINDO de ${name} apos 3 tentativas"
       continue
     fi
+    echo "OK clone ${name}"
   fi
   rm -rf "${BASE_DIR}/${name}/.git"
 done

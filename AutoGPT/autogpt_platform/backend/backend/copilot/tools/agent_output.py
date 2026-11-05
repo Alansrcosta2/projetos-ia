@@ -1,0 +1,647 @@
+"""Tool for retrieving agent execution outputs from user's library."""
+
+import logging
+import re
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from prisma.enums import APIKeyPermission
+from pydantic import BaseModel, Field, field_validator
+
+from backend.api.features.library.model import LibraryAgent
+from backend.copilot.constants import MAX_TOOL_WAIT_SECONDS
+from backend.copilot.gate.workflow import awaiting_whom, card_chat_for_run
+from backend.copilot.model import ChatSession
+from backend.data.db_accessors import execution_db, library_db
+from backend.data.execution import (
+    ExecutionStatus,
+    GraphExecution,
+    GraphExecutionMeta,
+    GraphExecutionWithNodes,
+)
+
+from .base import BaseTool, parameters_without
+from .execution_utils import (
+    TERMINAL_STATUSES,
+    NodeFailureSummary,
+    build_run_health_warning,
+    summarize_node_failures,
+    wait_for_execution,
+)
+from .external_scope import external_tenant, in_tenant
+from .models import (
+    AgentOutputResponse,
+    ErrorResponse,
+    ExecutionOutputInfo,
+    NoResultsResponse,
+    ToolResponseBase,
+)
+from .utils import fetch_graph_from_store_slug
+
+logger = logging.getLogger(__name__)
+
+
+class AgentOutputInput(BaseModel):
+    """Input parameters for the agent_output tool."""
+
+    agent_name: str = ""
+    library_agent_id: str = ""
+    store_slug: str = ""
+    execution_id: str = ""
+    run_time: str = "latest"
+    wait_if_running: int = Field(default=0, ge=0, le=MAX_TOOL_WAIT_SECONDS)
+    show_execution_details: bool = False
+
+    @field_validator(
+        "agent_name",
+        "library_agent_id",
+        "store_slug",
+        "execution_id",
+        "run_time",
+        mode="before",
+    )
+    @classmethod
+    def strip_strings(cls, v: Any) -> Any:
+        """Strip whitespace from string fields."""
+        return v.strip() if isinstance(v, str) else v
+
+
+def parse_time_expression(
+    time_expr: str | None,
+) -> tuple[datetime | None, datetime | None]:
+    """
+    Parse time expression into datetime range (start, end).
+
+    Supports: "latest", "yesterday", "today", "last week", "last 7 days",
+    "last month", "last 30 days", ISO date "YYYY-MM-DD", ISO datetime.
+    """
+    if not time_expr or time_expr.lower() == "latest":
+        return None, None
+
+    now = datetime.now(timezone.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    expr = time_expr.lower().strip()
+
+    # Relative time expressions lookup
+    relative_times: dict[str, tuple[datetime, datetime]] = {
+        "yesterday": (today_start - timedelta(days=1), today_start),
+        "today": (today_start, now),
+        "last week": (now - timedelta(days=7), now),
+        "last 7 days": (now - timedelta(days=7), now),
+        "last month": (now - timedelta(days=30), now),
+        "last 30 days": (now - timedelta(days=30), now),
+    }
+    if expr in relative_times:
+        return relative_times[expr]
+
+    # Try ISO date format (YYYY-MM-DD)
+    date_match = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", expr)
+    if date_match:
+        try:
+            year, month, day = map(int, date_match.groups())
+            start = datetime(year, month, day, 0, 0, 0, tzinfo=timezone.utc)
+            return start, start + timedelta(days=1)
+        except ValueError:
+            # Invalid date components (e.g., month=13, day=32)
+            pass
+
+    # Try ISO datetime
+    try:
+        parsed = datetime.fromisoformat(expr.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed - timedelta(hours=1), parsed + timedelta(hours=1)
+    except ValueError:
+        return None, None
+
+
+def _run_visible(
+    execution: GraphExecutionMeta, expert_id: str | None, tenant: str | None = None
+) -> bool:
+    """Personal AutoPilot sees every run; an expert only runs it started.
+
+    An External API call sees only runs in its organization.
+    """
+    return (expert_id is None or execution.expert_id == expert_id) and in_tenant(
+        execution.organization_id, tenant
+    )
+
+
+class AgentOutputTool(BaseTool):
+    """Tool for retrieving execution outputs from user's library agents."""
+
+    digest_large_output = True
+
+    @property
+    def name(self) -> str:
+        return "view_agent_output"
+
+    @property
+    def allow_external_use(self):
+        return True, [APIKeyPermission.READ_RUN]
+
+    @property
+    def external_parameters(self) -> dict[str, Any]:
+        # An external caller polls instead: each wait holds the request and an
+        # event-bus connection open for as long as the run takes.
+        return parameters_without(self.parameters, "wait_if_running")
+
+    @property
+    def description(self) -> str:
+        return (
+            "Retrieve execution outputs from a library agent. "
+            "Identify by agent_name, library_agent_id, or store_slug. "
+            "Filter by execution_id or run_time. "
+            "Optionally wait for running executions."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "agent_name": {
+                    "type": "string",
+                    "description": "Agent name (fuzzy match).",
+                },
+                "library_agent_id": {
+                    "type": "string",
+                    "description": "Library agent ID.",
+                },
+                "store_slug": {
+                    "type": "string",
+                    "description": "Marketplace 'username/agent-name'.",
+                },
+                "execution_id": {
+                    "type": "string",
+                    "description": "Specific execution ID.",
+                },
+                "run_time": {
+                    "type": "string",
+                    "description": "Time filter: 'latest', 'today', 'yesterday', 'last week', 'last 7 days', 'last month', 'last 30 days', 'YYYY-MM-DD', or ISO datetime.",
+                },
+                "wait_if_running": {
+                    "type": "integer",
+                    "description": (
+                        "Max seconds to wait if still running "
+                        f"(0-{MAX_TOOL_WAIT_SECONDS}). "
+                        "Returns current state on timeout."
+                    ),
+                    "minimum": 0,
+                    "maximum": MAX_TOOL_WAIT_SECONDS,
+                },
+                "show_execution_details": {
+                    "type": "boolean",
+                    "description": "If true, include full node-by-node execution trace (inputs, outputs, status, timing for each node). Useful for debugging agent wiring. Default: false.",
+                },
+            },
+            "required": [],
+        }
+
+    @property
+    def requires_auth(self) -> bool:
+        return True
+
+    async def _resolve_agent(
+        self,
+        user_id: str,
+        agent_name: str | None,
+        library_agent_id: str | None,
+        store_slug: str | None,
+        tenant: str | None = None,
+        external_caller: bool = False,
+    ) -> tuple[LibraryAgent | None, str | None]:
+        """
+        Resolve agent from provided identifiers.
+        Returns (library_agent, error_message).
+
+        Agents outside ``tenant`` count as not found.
+        """
+        lib_db = library_db()
+
+        # Priority 1: Exact library agent ID
+        if library_agent_id:
+            try:
+                agent = await lib_db.get_library_agent(library_agent_id, user_id)
+            except Exception as e:
+                logger.warning(f"Failed to get library agent by ID: {e}")
+                agent = None
+            if agent is None or not in_tenant(agent.organization_id, tenant):
+                return None, f"Library workflow '{library_agent_id}' not found"
+            return agent, None
+
+        # Priority 2: Store slug (username/agent-name)
+        if store_slug and "/" in store_slug:
+            username, agent_slug = store_slug.split("/", 1)
+            graph, _ = await fetch_graph_from_store_slug(username, agent_slug)
+            if not graph:
+                return None, f"Workflow '{store_slug}' not found in marketplace"
+
+            # Find in user's library by graph_id
+            agent = await lib_db.get_library_agent_by_graph_id(user_id, graph.id)
+            if not agent or not in_tenant(agent.organization_id, tenant):
+                return (
+                    None,
+                    f"Workflow '{store_slug}' is not in your library. "
+                    "Add it first to see outputs.",
+                )
+            return agent, None
+
+        # Priority 3: Fuzzy name search in library
+        if agent_name:
+            try:
+                response = await lib_db.list_library_agents(
+                    user_id=user_id,
+                    search_term=agent_name,
+                    page_size=5,
+                    organization_id=tenant,
+                )
+                if not response.agents:
+                    return (
+                        None,
+                        f"No workflows matching '{agent_name}' found in your library",
+                    )
+
+                # Return best match (first result from search)
+                return response.agents[0], None
+            except Exception as e:
+                logger.error(f"Error searching library agents: {e}")
+                # AutoPilot's model reads the text to recover; an External
+                # API client gets none, as `error_detail` gives it none.
+                detail = "an internal error" if external_caller else str(e)
+                return None, f"Error searching for workflow: {detail}"
+
+        return (
+            None,
+            "Please specify a workflow name, library_agent_id, or store_slug",
+        )
+
+    async def _get_execution(
+        self,
+        user_id: str,
+        graph_id: str,
+        execution_id: str | None,
+        time_start: datetime | None,
+        time_end: datetime | None,
+        include_running: bool = False,
+        include_node_executions: bool = False,
+        expert_id: str | None = None,
+        tenant: str | None = None,
+    ) -> tuple[
+        GraphExecution | GraphExecutionWithNodes | None,
+        list[GraphExecutionMeta],
+        str | None,
+    ]:
+        """
+        Fetch execution(s) based on filters.
+        Returns (single_execution, available_executions_meta, error_message).
+
+        Args:
+            include_running: If True, also look for running/queued executions (for waiting)
+            include_node_executions: If True, include node-by-node execution details
+            expert_id: Only runs this expert started; None sees every run.
+            tenant: Only runs in this organization; None sees every run.
+        """
+        exec_db = execution_db()
+
+        # If specific execution_id provided, fetch it directly
+        if execution_id:
+            execution = await exec_db.get_graph_execution(
+                user_id=user_id,
+                execution_id=execution_id,
+                include_node_executions=include_node_executions,
+            )
+            if not execution or not _run_visible(execution, expert_id, tenant):
+                return None, [], f"Execution '{execution_id}' not found"
+            return execution, [], None
+
+        # Determine which statuses to query
+        statuses = [ExecutionStatus.COMPLETED]
+        if include_running:
+            statuses.extend(
+                [
+                    ExecutionStatus.RUNNING,
+                    ExecutionStatus.QUEUED,
+                    ExecutionStatus.INCOMPLETE,
+                    ExecutionStatus.REVIEW,
+                    ExecutionStatus.FAILED,
+                    ExecutionStatus.TERMINATED,
+                ]
+            )
+
+        # Get executions with time filters
+        executions = await exec_db.get_graph_executions(
+            graph_id=graph_id,
+            user_id=user_id,
+            statuses=statuses,
+            created_time_gte=time_start,
+            created_time_lte=time_end,
+            limit=10,
+            expert_id=expert_id,
+        )
+        executions = [e for e in executions if in_tenant(e.organization_id, tenant)]
+
+        if not executions:
+            return None, [], None  # No error, just no executions
+
+        # If only one execution, fetch full details
+        if len(executions) == 1:
+            full_execution = await exec_db.get_graph_execution(
+                user_id=user_id,
+                execution_id=executions[0].id,
+                include_node_executions=include_node_executions,
+            )
+            return full_execution, [], None
+
+        # Multiple executions - return latest with full details, plus list of available
+        full_execution = await exec_db.get_graph_execution(
+            user_id=user_id,
+            execution_id=executions[0].id,
+            include_node_executions=include_node_executions,
+        )
+        return full_execution, executions, None
+
+    def _build_response(
+        self,
+        agent: LibraryAgent,
+        execution: GraphExecution | GraphExecutionWithNodes | None,
+        available_executions: list[GraphExecutionMeta],
+        session_id: str | None,
+        card_chat: str | None = None,
+    ) -> AgentOutputResponse:
+        """Build the response based on execution data. ``card_chat``: the chat
+        whose approval card a parked run waits on."""
+        library_agent_link = f"/library/agents/{agent.id}"
+
+        if not execution:
+            return AgentOutputResponse(
+                message=f"No completed executions found for workflow '{agent.name}'",
+                session_id=session_id,
+                agent_name=agent.name,
+                agent_id=agent.graph_id,
+                library_agent_id=agent.id,
+                library_agent_link=library_agent_link,
+                total_executions=0,
+            ).from_outside()
+
+        node_executions_data = None
+        node_failures: list[NodeFailureSummary] = []
+        if isinstance(execution, GraphExecutionWithNodes):
+            node_failures = summarize_node_failures(execution.node_executions)
+            node_executions_data = [
+                {
+                    "node_id": ne.node_id,
+                    "block_id": ne.block_id,
+                    "status": ne.status.value,
+                    "input_data": ne.input_data,
+                    "output_data": dict(ne.output_data),
+                    "start_time": ne.start_time.isoformat() if ne.start_time else None,
+                    "end_time": ne.end_time.isoformat() if ne.end_time else None,
+                }
+                for ne in execution.node_executions
+            ]
+
+        execution_info = ExecutionOutputInfo(
+            execution_id=execution.id,
+            status=execution.status.value,
+            started_at=execution.started_at,
+            ended_at=execution.ended_at,
+            outputs=dict(execution.outputs),
+            inputs_summary=execution.inputs if execution.inputs else None,
+            node_executions=node_executions_data,
+            nodes_failed=node_failures or None,
+        )
+
+        available_list = None
+        if len(available_executions) > 1:
+            available_list = [
+                {
+                    "id": e.id,
+                    "status": e.status.value,
+                    "started_at": e.started_at.isoformat() if e.started_at else None,
+                }
+                for e in available_executions[:5]
+            ]
+
+        # Build appropriate message based on execution status
+        if execution.status == ExecutionStatus.COMPLETED:
+            message = f"Found execution outputs for workflow '{agent.name}'"
+            health_warning = build_run_health_warning(
+                execution.outputs,
+                node_failures,
+                failed_node_count=(
+                    execution.stats.node_error_count if execution.stats else 0
+                ),
+            )
+            if health_warning:
+                if not isinstance(execution, GraphExecutionWithNodes):
+                    health_warning += (
+                        " Re-call with show_execution_details=true to see the "
+                        "per-node trace."
+                    )
+                message += f". {health_warning}"
+        elif execution.status == ExecutionStatus.FAILED:
+            message = f"Execution for workflow '{agent.name}' failed"
+        elif execution.status == ExecutionStatus.TERMINATED:
+            message = f"Execution for workflow '{agent.name}' was terminated"
+        elif execution.status == ExecutionStatus.REVIEW:
+            message = (
+                f"Execution for workflow '{agent.name}' "
+                f"{awaiting_whom(card_chat, session_id)}. "
+                "The user needs to approve it before it can continue."
+            )
+        elif execution.status in (
+            ExecutionStatus.RUNNING,
+            ExecutionStatus.QUEUED,
+            ExecutionStatus.INCOMPLETE,
+        ):
+            message = (
+                f"Execution for workflow '{agent.name}' is still {execution.status.value}. "
+                "Results may be incomplete. Use wait_if_running to wait for completion."
+            )
+        else:
+            message = f"Found execution for workflow '{agent.name}' (status: {execution.status.value})"
+
+        if len(available_executions) > 1:
+            message += (
+                f" Showing latest of {len(available_executions)} matching executions."
+            )
+
+        return AgentOutputResponse(
+            message=message,
+            session_id=session_id,
+            agent_name=agent.name,
+            agent_id=agent.graph_id,
+            library_agent_id=agent.id,
+            library_agent_link=library_agent_link,
+            execution=execution_info,
+            available_executions=available_list,
+            total_executions=len(available_executions) if available_executions else 1,
+        ).from_outside(execution_info)
+
+    async def _execute(
+        self,
+        user_id: str | None,
+        session: ChatSession,
+        **kwargs,
+    ) -> ToolResponseBase:
+        """Execute the agent_output tool.
+
+        Note: This tool accepts **kwargs and delegates to AgentOutputInput
+        for validation because the parameter set has cross-field validators
+        defined in the Pydantic model.
+        """
+        session_id = session.session_id
+        tenant = external_tenant(session)
+
+        # Parse and validate input
+        try:
+            input_data = AgentOutputInput(**kwargs)
+        except Exception as e:
+            logger.error(f"Invalid input: {e}")
+            return ErrorResponse(
+                message="Invalid input parameters",
+                error=str(e),
+                session_id=session_id,
+            ).from_outside()
+
+        # Ensure user_id is present (should be guaranteed by requires_auth)
+        if not user_id:
+            return ErrorResponse(
+                message="User authentication required",
+                session_id=session_id,
+            ).from_outside()
+
+        # Check if at least one identifier is provided
+        if not any(
+            [
+                input_data.agent_name,
+                input_data.library_agent_id,
+                input_data.store_slug,
+                input_data.execution_id,
+            ]
+        ):
+            return ErrorResponse(
+                message=(
+                    "Please specify at least one of: agent_name, "
+                    "library_agent_id, store_slug, or execution_id"
+                ),
+                session_id=session_id,
+            ).from_outside()
+
+        # If only execution_id provided, we need to find the agent differently
+        if (
+            input_data.execution_id
+            and not input_data.agent_name
+            and not input_data.library_agent_id
+            and not input_data.store_slug
+        ):
+            # Fetch execution directly to get graph_id
+            execution = await execution_db().get_graph_execution(
+                user_id=user_id,
+                execution_id=input_data.execution_id,
+                include_node_executions=input_data.show_execution_details,
+            )
+            if not execution or not _run_visible(execution, session.expert_id, tenant):
+                return ErrorResponse(
+                    message=f"Execution '{input_data.execution_id}' not found",
+                    session_id=session_id,
+                ).from_outside()
+
+            # Find library agent by graph_id
+            agent = await library_db().get_library_agent_by_graph_id(
+                user_id, execution.graph_id
+            )
+            if not agent or not in_tenant(agent.organization_id, tenant):
+                return NoResultsResponse(
+                    message=(
+                        f"Execution found but workflow not in your library. "
+                        f"Graph ID: {execution.graph_id}"
+                    ),
+                    session_id=session_id,
+                    suggestions=[
+                        "Add the workflow to your library to see more details"
+                    ],
+                ).from_outside()
+
+            return self._build_response(
+                agent,
+                execution,
+                [],
+                session_id,
+                await _card_chat(user_id, execution),
+            )
+
+        # Resolve agent from identifiers
+        agent, error = await self._resolve_agent(
+            user_id=user_id,
+            agent_name=input_data.agent_name or None,
+            library_agent_id=input_data.library_agent_id or None,
+            store_slug=input_data.store_slug or None,
+            tenant=tenant,
+            external_caller=session.external_caller,
+        )
+
+        if error or not agent:
+            return NoResultsResponse(
+                message=error or "Workflow not found",
+                session_id=session_id,
+                suggestions=[
+                    "Check the workflow name or ID",
+                    "Make sure the workflow is in your library",
+                ],
+            )
+
+        # Parse time expression
+        time_start, time_end = parse_time_expression(input_data.run_time)
+
+        # Check if we should wait for running executions
+        wait_timeout = input_data.wait_if_running
+
+        # Fetch execution(s) - include running if we're going to wait
+        execution, available_executions, exec_error = await self._get_execution(
+            expert_id=session.expert_id,
+            tenant=tenant,
+            user_id=user_id,
+            graph_id=agent.graph_id,
+            execution_id=input_data.execution_id or None,
+            time_start=time_start,
+            time_end=time_end,
+            include_running=wait_timeout > 0,
+            include_node_executions=input_data.show_execution_details,
+        )
+
+        if exec_error:
+            return ErrorResponse(
+                message=exec_error,
+                session_id=session_id,
+            )
+
+        # If we have an execution that's still running and we should wait
+        if execution and wait_timeout > 0 and execution.status not in TERMINAL_STATUSES:
+            logger.info(
+                f"Execution {execution.id} is {execution.status}, "
+                f"waiting up to {wait_timeout}s for completion"
+            )
+            execution = await wait_for_execution(
+                user_id=user_id,
+                graph_id=agent.graph_id,
+                execution_id=execution.id,
+                timeout_seconds=wait_timeout,
+            )
+
+        return self._build_response(
+            agent,
+            execution,
+            available_executions,
+            session_id,
+            await _card_chat(user_id, execution),
+        )
+
+
+async def _card_chat(
+    user_id: str, execution: GraphExecution | GraphExecutionWithNodes | None
+) -> str | None:
+    if execution is None or execution.status != ExecutionStatus.REVIEW:
+        return None
+    return await card_chat_for_run(user_id, execution.id)

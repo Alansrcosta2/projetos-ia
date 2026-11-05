@@ -1,0 +1,177 @@
+"use client";
+
+import { AgentExecutionStatus } from "@/app/api/__generated__/models/agentExecutionStatus";
+import { LoadingSpinner } from "@/components/atoms/LoadingSpinner/LoadingSpinner";
+import { Text } from "@/components/atoms/Text/Text";
+import { isCompletedWithErrors } from "@/lib/run-health";
+import { formatTimeAgo } from "@/lib/utils/time";
+import Link, { useLinkStatus } from "next/link";
+import type { AgentExecutionWithInfo } from "../helpers";
+import { getExecutionDuration } from "../helpers";
+import {
+  Alert01Icon,
+  Alert02Icon,
+  ArrowUpRight01Icon,
+  CheckmarkCircle02Icon,
+  Clock01Icon,
+  Loading03Icon,
+  MinusSignCircleIcon,
+  StopCircleIcon,
+} from "@hugeicons/core-free-icons";
+import { Icon } from "@/components/atoms/Icon/Icon";
+
+function ActivityNavIndicator() {
+  const { pending } = useLinkStatus();
+  if (pending) {
+    return (
+      <LoadingSpinner
+        size="small"
+        className="shrink-0 text-foreground-subtle"
+        aria-hidden="true"
+      />
+    );
+  }
+  return (
+    <Icon
+      icon={ArrowUpRight01Icon}
+      size={16}
+      tone="subtle"
+      className="shrink-0"
+      aria-hidden="true"
+    />
+  );
+}
+
+interface Props {
+  execution: AgentExecutionWithInfo;
+}
+
+export function ActivityItem({ execution }: Props) {
+  function getStatusIcon() {
+    switch (execution.status) {
+      case AgentExecutionStatus.QUEUED:
+        return <Icon icon={Clock01Icon} size={18} tone="brand" />;
+      case AgentExecutionStatus.RUNNING:
+        return <Icon icon={Loading03Icon} size={18} spin tone="brand" />;
+      case AgentExecutionStatus.COMPLETED:
+        return isCompletedWithErrors(execution) ? (
+          <Icon icon={Alert02Icon} size={18} tone="warning" />
+        ) : (
+          <Icon icon={CheckmarkCircle02Icon} size={18} tone="brand" />
+        );
+      case AgentExecutionStatus.FAILED:
+        return <Icon icon={Alert01Icon} size={18} tone="brand" />;
+      case AgentExecutionStatus.TERMINATED:
+        return <Icon icon={StopCircleIcon} size={18} tone="brand" />;
+      case AgentExecutionStatus.INCOMPLETE:
+        return <Icon icon={MinusSignCircleIcon} size={18} tone="brand" />;
+      case AgentExecutionStatus.REVIEW:
+        return (
+          <Icon
+            icon={Alert01Icon}
+            size={18}
+            className="text-yellow-foreground"
+          />
+        );
+      default:
+        return null;
+    }
+  }
+
+  function getItemDisplay() {
+    // Handle active statuses (running/queued)
+    const isActiveStatus =
+      execution.status === AgentExecutionStatus.RUNNING ||
+      execution.status === AgentExecutionStatus.QUEUED;
+
+    if (isActiveStatus) {
+      const timeAgo = execution.started_at
+        ? formatTimeAgo(execution.started_at.toString())
+        : "recently";
+      const statusText =
+        execution.status === AgentExecutionStatus.QUEUED ? "queued" : "running";
+      return [
+        `Started ${timeAgo}, ${getExecutionDuration(execution)} ${statusText}`,
+      ];
+    }
+
+    // Handle all other statuses with time display
+    const timeAgo = execution.ended_at
+      ? formatTimeAgo(execution.ended_at.toString())
+      : execution.started_at
+        ? formatTimeAgo(execution.started_at.toString())
+        : "recently";
+
+    let statusText = "ended";
+    switch (execution.status) {
+      case AgentExecutionStatus.COMPLETED:
+        statusText = isCompletedWithErrors(execution)
+          ? "completed with errors"
+          : "completed";
+        break;
+      case AgentExecutionStatus.FAILED:
+        statusText = "failed";
+        break;
+      case AgentExecutionStatus.TERMINATED:
+        statusText = "stopped";
+        break;
+      case AgentExecutionStatus.INCOMPLETE:
+        statusText = "incomplete";
+        break;
+      case AgentExecutionStatus.REVIEW:
+        statusText = "awaiting approval";
+        break;
+    }
+
+    return [
+      `${statusText.charAt(0).toUpperCase() + statusText.slice(1)} ${timeAgo}`,
+    ];
+  }
+
+  // Determine the tab based on execution status
+  const searchParams = new URLSearchParams();
+  const isReview = execution.status === AgentExecutionStatus.REVIEW;
+  searchParams.set("activeTab", isReview ? "reviews" : "runs");
+  searchParams.set("activeItem", execution.id);
+  const linkUrl = `/library/agents/${execution.library_agent_id}?${searchParams.toString()}`;
+  const withExecutionLink = execution.library_agent_id && execution.id;
+
+  const content = (
+    <>
+      {/* Icon + Agent Name */}
+      <div className="flex items-center space-x-2">
+        {getStatusIcon()}
+        <Text variant="small-medium" className="max-w-44 truncate">
+          {execution.agent_name}
+        </Text>
+      </div>
+
+      {/* Agent Message - Indented */}
+      <div className="ml-7 pt-1">
+        {getItemDisplay().map((line, index) => (
+          <Text
+            key={index}
+            variant="small"
+            tone={index === 0 ? "secondary" : "muted"}
+          >
+            {line}
+          </Text>
+        ))}
+      </div>
+    </>
+  );
+
+  if (withExecutionLink) {
+    return (
+      <Link
+        className="flex cursor-pointer items-center justify-between gap-2 rounded-xl px-2 py-3 transition-colors hover:bg-surface-hover"
+        href={linkUrl}
+      >
+        <div className="min-w-0 flex-1">{content}</div>
+        <ActivityNavIndicator />
+      </Link>
+    );
+  }
+
+  return <div className="block rounded-xl px-2 py-3">{content}</div>;
+}

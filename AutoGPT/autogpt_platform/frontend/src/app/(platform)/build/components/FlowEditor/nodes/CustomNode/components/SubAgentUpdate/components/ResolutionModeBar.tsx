@@ -1,0 +1,137 @@
+import React from "react";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/atoms/Tooltip/BaseTooltip";
+import { IncompatibilityInfo } from "@/app/(platform)/build/hooks/useSubAgentUpdate/types";
+import { Alert01Icon, InformationCircleIcon } from "@hugeicons/core-free-icons";
+import { Icon } from "@/components/atoms/Icon/Icon";
+import { Text } from "@/components/atoms/Text/Text";
+
+type ResolutionModeBarProps = {
+  incompatibilities: IncompatibilityInfo | null;
+};
+
+export function ResolutionModeBar({
+  incompatibilities,
+}: ResolutionModeBarProps): React.ReactElement {
+  const renderIncompatibilities = () => {
+    if (!incompatibilities) return <span>No incompatibilities</span>;
+
+    const sections: React.ReactNode[] = [];
+
+    if (incompatibilities.missingInputs.length > 0) {
+      sections.push(
+        <div key="missing-inputs" className="mb-1">
+          <Text variant="small-semibold-tight" as="span" tone="inherit">
+            Missing inputs:{" "}
+          </Text>
+          {incompatibilities.missingInputs.map((name, i) => (
+            <React.Fragment key={name}>
+              <Text variant="small-mono-tight" as="code" tone="inherit">
+                {name}
+              </Text>
+              {i < incompatibilities.missingInputs.length - 1 && ", "}
+            </React.Fragment>
+          ))}
+        </div>,
+      );
+    }
+    if (incompatibilities.missingOutputs.length > 0) {
+      sections.push(
+        <div key="missing-outputs" className="mb-1">
+          <Text variant="small-semibold-tight" as="span" tone="inherit">
+            Missing outputs:{" "}
+          </Text>
+          {incompatibilities.missingOutputs.map((name, i) => (
+            <React.Fragment key={name}>
+              <Text variant="small-mono-tight" as="code" tone="inherit">
+                {name}
+              </Text>
+              {i < incompatibilities.missingOutputs.length - 1 && ", "}
+            </React.Fragment>
+          ))}
+        </div>,
+      );
+    }
+    if (incompatibilities.newRequiredInputs.length > 0) {
+      sections.push(
+        <div key="new-required" className="mb-1">
+          <Text variant="small-semibold-tight" as="span" tone="inherit">
+            New required inputs:{" "}
+          </Text>
+          {incompatibilities.newRequiredInputs.map((name, i) => (
+            <React.Fragment key={name}>
+              <Text variant="small-mono-tight" as="code" tone="inherit">
+                {name}
+              </Text>
+              {i < incompatibilities.newRequiredInputs.length - 1 && ", "}
+            </React.Fragment>
+          ))}
+        </div>,
+      );
+    }
+    if (incompatibilities.inputTypeMismatches.length > 0) {
+      sections.push(
+        <div key="type-mismatches" className="mb-1">
+          <Text variant="small-semibold-tight" as="span" tone="inherit">
+            Type changed:{" "}
+          </Text>
+          {incompatibilities.inputTypeMismatches.map((m, i) => (
+            <React.Fragment key={m.name}>
+              <Text variant="small-mono-tight" as="code" tone="inherit">
+                {m.name}
+              </Text>
+              <span className="text-foreground-subtle">
+                {" "}
+                ({m.oldType} → {m.newType})
+              </span>
+              {i < incompatibilities.inputTypeMismatches.length - 1 && ", "}
+            </React.Fragment>
+          ))}
+        </div>,
+      );
+    }
+
+    return <>{sections}</>;
+  };
+
+  return (
+    <div className="flex items-center justify-between gap-2 rounded-t-xl bg-warning-surface px-3 py-2">
+      <div className="flex items-center gap-2">
+        <Icon icon={Alert01Icon} tone="warning" className="h-4 w-4" />
+        <Text variant="body-tight" tone="warning" as="span">
+          Remove incompatible connections
+        </Text>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Icon
+              icon={InformationCircleIcon}
+              tone="warning-bright"
+              className="h-4 w-4 cursor-help"
+            />
+          </TooltipTrigger>
+          <TooltipContent className="max-w-sm">
+            <Text
+              variant="small-semibold-lh-normal"
+              tone="inherit"
+              className="mb-2"
+            >
+              Incompatible changes:
+            </Text>
+            <Text variant="small-tight" tone="inherit" as="div">
+              {renderIncompatibilities()}
+            </Text>
+            <Text variant="small-tight" tone="subtle" className="mt-2">
+              {(incompatibilities?.newRequiredInputs.length ?? 0) > 0
+                ? "Replace / delete"
+                : "Delete"}{" "}
+              the red connections to continue
+            </Text>
+          </TooltipContent>
+        </Tooltip>
+      </div>
+    </div>
+  );
+}

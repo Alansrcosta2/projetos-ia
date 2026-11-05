@@ -1,0 +1,390 @@
+import { cn } from "@/lib/utils";
+import { useOnboarding } from "@/providers/onboarding/onboarding-provider";
+import {
+  ArrowDown01Icon,
+  HelpCircleIcon,
+  Tick02Icon,
+} from "@hugeicons/core-free-icons";
+import { Icon } from "@/components/atoms/Icon/Icon";
+import confetti, { type Options as ConfettiOptions } from "canvas-confetti";
+import { AGPT_CONFETTI_COLORS } from "@/components/molecules/Confetti/Confetti";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Task, TaskGroup } from "../helpers";
+
+interface Props {
+  groups: TaskGroup[];
+}
+
+export function TaskGroups({ groups }: Props) {
+  const { state, updateState } = useOnboarding();
+  const refs = useRef<Record<string, HTMLDivElement | null>>({});
+  const confettiTimers = useRef(new Set<ReturnType<typeof setTimeout>>());
+
+  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>(() => {
+    const initialState: Record<string, boolean> = {};
+    groups.forEach((group) => {
+      const completed = group.tasks.every((task) =>
+        state?.completedSteps?.includes(task.id),
+      );
+      initialState[group.name] = !completed;
+    });
+    return initialState;
+  });
+
+  const toggleGroup = useCallback((name: string) => {
+    setOpenGroups((prev) => ({
+      ...prev,
+      [name]: !prev[name],
+    }));
+  }, []);
+
+  const isTaskCompleted = useCallback(
+    (task: Task) => {
+      return state?.completedSteps?.includes(task.id) || false;
+    },
+    [state?.completedSteps],
+  );
+
+  const getCompletedCount = useCallback(
+    (tasks: Task[]) => {
+      return tasks.filter((task) => isTaskCompleted(task)).length;
+    },
+    [isTaskCompleted],
+  );
+
+  const isGroupCompleted = useCallback(
+    (group: TaskGroup) => {
+      return group.tasks.every((task) => isTaskCompleted(task));
+    },
+    [isTaskCompleted],
+  );
+
+  useEffect(() => {
+    // Close completed groups
+    setOpenGroups((prevGroups) =>
+      groups.reduce(
+        (acc, group) => {
+          acc[group.name] = isGroupCompleted(group)
+            ? false
+            : prevGroups[group.name];
+          return acc;
+        },
+        {} as Record<string, boolean>,
+      ),
+    );
+  }, [state?.completedSteps, isGroupCompleted, groups]);
+
+  const setRef = (name: string) => (el: HTMLDivElement | null) => {
+    if (el) {
+      refs.current[name] = el;
+    }
+  };
+
+  const scrollIntoViewCentered = useCallback((el: HTMLDivElement) => {
+    el.scrollIntoView({
+      behavior: "smooth",
+      block: "center",
+      inline: "nearest",
+    });
+  }, []);
+
+  const delayConfetti = useCallback((el: HTMLDivElement, count: number) => {
+    const timer = setTimeout(() => {
+      confettiTimers.current.delete(timer);
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      const shared: ConfettiOptions = {
+        particleCount: count,
+        spread: 60,
+        shapes: ["square"],
+        scalar: 1.2,
+        startVelocity: 22,
+        gravity: 0.5,
+        decay: 0.93,
+        ticks: 120,
+        colors: AGPT_CONFETTI_COLORS,
+        origin: {
+          x: (rect.left + rect.width / 2) / window.innerWidth,
+          y: (rect.top + rect.height / 2) / window.innerHeight,
+        },
+      };
+      confetti({ ...shared, angle: 45 });
+      confetti({ ...shared, angle: 135 });
+    }, 300);
+    confettiTimers.current.add(timer);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      confettiTimers.current.forEach(clearTimeout);
+      confettiTimers.current.clear();
+    };
+  }, []);
+
+  useEffect(() => {
+    groups.forEach((group) => {
+      const groupCompleted = isGroupCompleted(group);
+      // Check if all tasks in the group were already celebrated
+      // last task completed triggers group completion
+      const alreadyCelebrated = group.tasks.every((task) =>
+        (state?.notified ?? []).includes(task.id),
+      );
+
+      if (groupCompleted) {
+        const el = refs.current[group.name];
+        if (el && !alreadyCelebrated) {
+          scrollIntoViewCentered(el);
+          delayConfetti(el, 600);
+          // Update the state to include all group tasks as notified
+          // This ensures that the confetti effect isn't perpetually triggered on Wallet
+          const notifiedTasks = group.tasks.map((task) => task.id);
+          updateState({
+            notified: [...(state?.notified || []), ...notifiedTasks],
+          });
+        }
+        return;
+      }
+
+      group.tasks.forEach((task) => {
+        const el = refs.current[task.id];
+        if (
+          el &&
+          isTaskCompleted(task) &&
+          !(state?.notified ?? []).includes(task.id)
+        ) {
+          scrollIntoViewCentered(el);
+          delayConfetti(el, 400);
+          // Update the state to include the task as notified
+          updateState({ notified: [...(state?.notified || []), task.id] });
+        }
+      });
+    });
+  }, [
+    state?.completedSteps,
+    delayConfetti,
+    groups,
+    updateState,
+    state?.notified,
+    isGroupCompleted,
+    isTaskCompleted,
+    scrollIntoViewCentered,
+  ]);
+
+  return (
+    <div className="space-y-2">
+      {groups.map((group) => (
+        <div
+          key={group.name}
+          ref={setRef(group.name)}
+          className="mt-3 overflow-hidden rounded-lg border border-separator bg-surface-muted"
+        >
+          {/* Group Header */}
+          <div
+            className="flex cursor-pointer items-center justify-between p-3"
+            onClick={() => toggleGroup(group.name)}
+          >
+            {/* Name, details and completed count */}
+            <div className="flex-1">
+              <div className="text-body font-medium text-foreground-strong">
+                {group.name}
+              </div>
+              <div className="mt-1 text-caption leading-tight font-normal text-foreground-tertiary">
+                {group.details}
+                <br />
+                {getCompletedCount(group.tasks)} of {group.tasks.length}{" "}
+                completed
+              </div>
+            </div>
+            {/* Reward and chevron */}
+            <div className="flex items-center gap-2">
+              {isGroupCompleted(group) ? (
+                <div className="rounded-full bg-success/40 px-2.5 py-0.5 font-sans text-caption font-medium text-success-foreground">
+                  Done
+                </div>
+              ) : (
+                <div className="text-caption leading-tight font-medium text-brand">
+                  $
+                  {group.tasks
+                    .reduce((sum, task) => sum + task.amount, 0)
+                    .toFixed(2)}
+                </div>
+              )}
+              <span
+                className={`flex text-foreground-base transition-transform duration-300 ease-in-out ${openGroups[group.name] ? "rotate-180" : ""}`}
+              >
+                <Icon aria-hidden icon={ArrowDown01Icon} className="h-5 w-5" />
+              </span>
+            </div>
+          </div>
+
+          {/* Tasks */}
+          <div
+            className={cn(
+              "overflow-hidden transition-all duration-300 ease-in-out",
+              openGroups[group.name] || !isGroupCompleted(group)
+                ? "max-h-[1200px] opacity-100"
+                : "max-h-0 opacity-0",
+            )}
+          >
+            {group.tasks.map((task) => (
+              <div
+                key={task.id}
+                ref={setRef(task.id)}
+                className="mx-3 border-t border-border-base px-1 pt-3 pb-0.5"
+              >
+                <div className="mb-2 flex items-center justify-between">
+                  {/* Checkmark and name */}
+                  <div className="flex items-center gap-2">
+                    <div
+                      className={cn(
+                        "flex h-4 w-4 items-center justify-center rounded-full border",
+                        isTaskCompleted(task)
+                          ? "border-success"
+                          : "border-foreground-secondary",
+                      )}
+                    >
+                      {isTaskCompleted(task) && (
+                        <span className="flex text-success">
+                          <Icon
+                            aria-hidden
+                            icon={Tick02Icon}
+                            className="h-3 w-3"
+                          />
+                        </span>
+                      )}
+                    </div>
+                    <span
+                      className={cn(
+                        "text-body font-normal",
+                        isTaskCompleted(task)
+                          ? "text-foreground-tertiary line-through"
+                          : "text-foreground-emphasis",
+                      )}
+                    >
+                      {task.name}
+                    </span>
+                  </div>
+                  {/* Reward */}
+                  {task.amount > 0 && (
+                    <span
+                      className={cn(
+                        "text-caption font-normal text-foreground-tertiary",
+                        isTaskCompleted(task) ? "line-through" : "",
+                      )}
+                    >
+                      ${task.amount.toFixed(2)}
+                    </span>
+                  )}
+                </div>
+                {/* Progress bar and counter text */}
+                {task.progress && !isTaskCompleted(task) && (
+                  <div className="mb-1 flex w-full items-center justify-between pr-3 pl-6">
+                    <div className="h-2 flex-1 overflow-hidden rounded-full bg-surface-hover">
+                      <div
+                        className="h-full bg-brand/60 transition-all duration-500 ease-in-out"
+                        style={{
+                          width: `${Math.min(
+                            100,
+                            (task.progress.current / task.progress.target) *
+                              100,
+                          )}%`,
+                        }}
+                      />
+                    </div>
+                    <span className="mx-1 w-8 text-right text-caption font-normal text-foreground-tertiary">
+                      {(
+                        (task.progress.current / task.progress.target) *
+                        100
+                      ).toFixed(0)}
+                      %
+                    </span>
+                  </div>
+                )}
+                {/* Details section */}
+                {!isGroupCompleted(group) && (
+                  <>
+                    <div
+                      className={cn(
+                        "mt-0 overflow-hidden pt-0 pl-6 text-caption font-normal text-foreground-tertiary transition-all duration-300 ease-in-out",
+                        isTaskCompleted(task) && "line-through",
+                        openGroups[group.name]
+                          ? "max-h-[100px] opacity-100"
+                          : "max-h-0 opacity-0",
+                      )}
+                    >
+                      {task.details}
+                    </div>
+                    {task.video ? (
+                      <div
+                        className={cn(
+                          "relative mx-6 aspect-video overflow-hidden rounded-lg transition-all duration-300 ease-in-out",
+                          openGroups[group.name]
+                            ? "my-2 max-h-[200px] opacity-100"
+                            : "max-h-0 opacity-0",
+                        )}
+                      >
+                        <video
+                          src={task.video}
+                          autoPlay
+                          loop
+                          muted
+                          playsInline
+                          className={cn(
+                            "h-full w-full object-cover object-center",
+                            isTaskCompleted(task) && "grayscale",
+                          )}
+                        ></video>
+                      </div>
+                    ) : (
+                      <div className="mb-1" />
+                    )}
+                  </>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+      {/* Hidden Tasks group */}
+      <div className="mt-3 overflow-hidden rounded-lg border border-separator bg-surface-muted">
+        {/* Group Header */}
+        <div className="flex items-center justify-between p-3">
+          {/* Name and details */}
+          <div className="flex-1">
+            <div className="text-body font-medium text-foreground-strong">
+              Hidden Tasks
+            </div>
+            <div className="mt-1 text-caption leading-tight font-normal text-foreground-tertiary">
+              Check back later — new tasks are on the way
+            </div>
+          </div>
+        </div>
+        {/* Tasks */}
+        <div>
+          <div className="mx-3 border-t border-border-base px-1 pt-3 pb-1">
+            <div className="mb-2 flex items-center justify-between">
+              {/* Question mark and rectangle */}
+              <div className="flex items-center gap-2">
+                <div className="flex h-4 w-4 items-center justify-center">
+                  <Icon aria-hidden icon={HelpCircleIcon} size={24} />
+                </div>
+                <div className="h-4 w-64 rounded-full bg-surface-hover" />
+              </div>
+            </div>
+          </div>
+          <div className="mx-3 border-t border-border-base px-1 pt-3 pb-1">
+            <div className="mb-2 flex items-center justify-between">
+              {/* Question mark and rectangle */}
+              <div className="flex items-center gap-2">
+                <div className="flex h-4 w-4 items-center justify-center">
+                  <Icon aria-hidden icon={HelpCircleIcon} size={24} />
+                </div>
+                <div className="h-4 w-64 rounded-full bg-surface-hover" />
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

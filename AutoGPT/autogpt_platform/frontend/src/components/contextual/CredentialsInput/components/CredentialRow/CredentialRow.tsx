@@ -1,0 +1,174 @@
+import { Text } from "@/components/atoms/Text/Text";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/molecules/DropdownMenu/DropdownMenu";
+import { cn } from "@/lib/utils";
+import { useEffect, useRef, useState } from "react";
+import { CredentialsType } from "@/lib/autogpt-server-api/types";
+import {
+  fallbackIcon,
+  getCredentialDisplayName,
+  getCredentialTypeIcon,
+  getCredentialTypeLabel,
+  MASKED_KEY_LENGTH,
+  providerIcons,
+} from "../../helpers";
+import { ArrowDown01Icon, MoreVerticalIcon } from "@hugeicons/core-free-icons";
+import { Icon } from "@/components/atoms/Icon/Icon";
+
+type CredentialRowProps = {
+  credential: {
+    id: string;
+    title?: string;
+    username?: string;
+    type: string;
+    provider: string;
+  };
+  provider: string;
+  displayName: string;
+  onSelect: () => void;
+  onDelete?: () => void;
+  readOnly?: boolean;
+  showCaret?: boolean;
+  asSelectTrigger?: boolean;
+  /** When "node", applies compact styling for node context */
+  variant?: "default" | "node";
+};
+
+export function CredentialRow({
+  credential,
+  provider,
+  displayName,
+  onSelect,
+  onDelete,
+  readOnly = false,
+  showCaret = false,
+  asSelectTrigger = false,
+  variant = "default",
+}: CredentialRowProps) {
+  const ProviderIcon = providerIcons[provider] || fallbackIcon;
+  const isRealCredentialType = [
+    "api_key",
+    "oauth2",
+    "user_password",
+    "host_scoped",
+  ].includes(credential.type);
+  const credType = credential.type as CredentialsType;
+  const TypeIcon = isRealCredentialType
+    ? getCredentialTypeIcon(credType, provider)
+    : fallbackIcon;
+  const isNodeVariant = variant === "node";
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [showMaskedKey, setShowMaskedKey] = useState(true);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const resizeObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const width = entry.contentRect.width;
+        setShowMaskedKey(width >= 360);
+      }
+    });
+
+    resizeObserver.observe(container);
+
+    return () => {
+      resizeObserver.disconnect();
+    };
+  }, []);
+
+  return (
+    <div
+      ref={containerRef}
+      className={cn(
+        "flex min-w-[20rem] items-center gap-3 rounded-medium border border-border-base bg-surface p-3 transition-colors",
+        asSelectTrigger && isNodeVariant
+          ? "min-w-0 flex-1 overflow-hidden border-0 bg-transparent"
+          : asSelectTrigger
+            ? "border-0 bg-transparent"
+            : readOnly
+              ? "w-fit"
+              : "",
+        (showCaret || asSelectTrigger) && "cursor-pointer",
+        readOnly && !showCaret && !asSelectTrigger && "cursor-default",
+      )}
+      onClick={readOnly || showCaret || asSelectTrigger ? undefined : onSelect}
+    >
+      <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-action-hover">
+        <ProviderIcon className="h-3 w-3 text-action-foreground" />
+      </div>
+      <TypeIcon className="h-5 w-5 shrink-0 text-foreground-emphasis" />
+      <div
+        className={cn(
+          "relative flex min-w-0 flex-1 flex-nowrap items-center gap-4",
+          isNodeVariant && "overflow-hidden",
+        )}
+      >
+        <div className="flex min-w-0 flex-1 items-center gap-2">
+          <Text
+            variant="body"
+            tracking="tight"
+            className={cn(
+              "min-w-0 shrink",
+              isNodeVariant ? "truncate" : "line-clamp-1 text-ellipsis",
+            )}
+          >
+            {getCredentialDisplayName(credential, displayName)}
+          </Text>
+          {isRealCredentialType && (
+            <span className="shrink-0 rounded bg-surface-hover px-1.5 py-0.5 text-tiny leading-tight font-medium text-foreground-tertiary">
+              {getCredentialTypeLabel(credType)}
+            </span>
+          )}
+        </div>
+        {!(asSelectTrigger && isNodeVariant) && showMaskedKey && (
+          <Text
+            variant="large"
+            mono
+            tracking="tight"
+            className={cn(
+              "absolute top-[65%] -translate-y-1/2 overflow-hidden whitespace-nowrap",
+              asSelectTrigger ? "right-0" : "right-6",
+            )}
+          >
+            {"*".repeat(MASKED_KEY_LENGTH)}
+          </Text>
+        )}
+      </div>
+      {(showCaret || (asSelectTrigger && !readOnly)) && (
+        <Icon
+          icon={ArrowDown01Icon}
+          tone="subtle"
+          className="h-4 w-4 shrink-0"
+        />
+      )}
+      {!readOnly && !showCaret && !asSelectTrigger && onDelete && (
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <button
+              className="ml-auto shrink-0 rounded p-1 hover:bg-surface-hover"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <Icon icon={MoreVerticalIcon} tone="subtle" className="h-5 w-5" />
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            <DropdownMenuItem
+              onClick={(e) => {
+                e.stopPropagation();
+                onDelete();
+              }}
+            >
+              Delete
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      )}
+    </div>
+  );
+}

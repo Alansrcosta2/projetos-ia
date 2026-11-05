@@ -1,0 +1,1798 @@
+import re
+from abc import ABC
+from collections.abc import Callable
+from pathlib import Path
+from typing import (
+    Any,
+    Literal,
+    Self,
+)
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from invokeai.backend.model_manager.configs.base import (
+    Config_Base,
+)
+from invokeai.backend.model_manager.configs.controlnet import ControlAdapterDefaultSettings
+from invokeai.backend.model_manager.configs.flux2_variant import (
+    FLUX2_CONTEXT_IN_DIMS,
+    flux2_variant_from_context_dim,
+    flux2_variant_from_hidden_size,
+    flux2_variant_from_vec_dim,
+)
+from invokeai.backend.model_manager.configs.identification_utils import (
+    InvalidMatchError,
+    NotAMatchError,
+    raise_for_override_fields,
+    raise_if_not_dir,
+    raise_if_not_file,
+    state_dict_has_any_keys_ending_with,
+    state_dict_has_any_keys_starting_with,
+)
+from invokeai.backend.model_manager.configs.main import _detect_wan_expert
+from invokeai.backend.model_manager.model_on_disk import ModelOnDisk
+from invokeai.backend.model_manager.omi import flux_dev_1_lora, stable_diffusion_xl_1_lora
+from invokeai.backend.model_manager.taxonomy import (
+    BaseModelType,
+    Flux2VariantType,
+    FluxLoRAFormat,
+    ModelFormat,
+    ModelType,
+    WanLoRAVariantType,
+    ZImageVariantType,
+)
+from invokeai.backend.model_manager.util.model_util import lora_token_vector_length
+from invokeai.backend.patches.lora_conversions.anima_lora_constants import (
+    has_cosmos_dit_kohya_keys,
+    has_cosmos_dit_kohya_keys_strict,
+    has_cosmos_dit_peft_keys,
+    has_cosmos_dit_peft_keys_strict,
+)
+from invokeai.backend.patches.lora_conversions.flux3_lora_constants import (
+    describe_refusal,
+    has_flux3_lora_keys,
+    misshapen_flux3_layers,
+    peft_scale,
+    read_flux3_lora_keys,
+)
+from invokeai.backend.patches.lora_conversions.flux_control_lora_utils import is_state_dict_likely_flux_control
+from invokeai.backend.patches.lora_conversions.krea2_lora_constants import LOKR_WEIGHT_KEYS, is_kohya_krea2_lora_key
+from invokeai.backend.patches.lora_conversions.ltx2_lora_constants import (
+    has_ltx2_lora_keys,
+    has_non_ltx2_architecture_keys,
+    has_unsupported_ltx2_lora_variant_keys,
+)
+from invokeai.backend.patches.lora_conversions.minimax_h3_lora_constants import (
+    find_minimax_h3_lora_defect,
+    has_minimax_h3_lora_keys,
+    has_non_minimax_h3_architecture_keys,
+    has_unsupported_minimax_h3_lora_variant_keys,
+)
+from invokeai.backend.patches.lora_conversions.qwen_image_2_1_lora_constants import (
+    unsupported_keys as qwen_image_21_unsupported_lora_keys,
+)
+from invokeai.backend.patches.lora_conversions.wan_lora_constants import (
+    detect_wan_lora_variant,
+    has_non_wan_architecture_keys,
+    has_wan_kohya_keys,
+    has_wan_peft_keys,
+)
+
+# Defaults used to compute the effective slider range when one or both bounds
+# are unset. These intentionally mirror the frontend's DEFAULT_LORA_WEIGHT_CONFIG
+# in invokeai/frontend/webv1/src/features/controlLayers/store/lorasSlice.ts so that
+# bound/weight validation produces the same result whether it runs in the form
+# or in this pydantic model.
+_DEFAULT_LORA_WEIGHT_SLIDER_MIN = -1.0
+_DEFAULT_LORA_WEIGHT_SLIDER_MAX = 2.0
+
+
+class LoraModelDefaultSettings(BaseModel):
+    weight: float | None = Field(default=None, description="Default weight for this model")
+    weight_min: float | None = Field(default=None, description="Minimum weight slider value for this model")
+    weight_max: float | None = Field(default=None, description="Maximum weight slider value for this model")
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def _validate_weight_bounds(self) -> "LoraModelDefaultSettings":
+        effective_min = self.weight_min if self.weight_min is not None else _DEFAULT_LORA_WEIGHT_SLIDER_MIN
+        effective_max = self.weight_max if self.weight_max is not None else _DEFAULT_LORA_WEIGHT_SLIDER_MAX
+        if effective_min >= effective_max:
+            raise ValueError(
+                f"effective weight range is invalid: min ({effective_min}) must be less than max ({effective_max})"
+            )
+        if self.weight is not None and not (effective_min <= self.weight <= effective_max):
+            raise ValueError(
+                f"weight ({self.weight}) must be within the effective range [{effective_min}, {effective_max}]"
+            )
+        return self
+
+
+class LoRA_Config_Base(ABC, BaseModel):
+    """Base class for LoRA models."""
+
+    type: Literal[ModelType.LoRA] = Field(default=ModelType.LoRA)
+    trigger_phrases: set[str] | None = Field(
+        default=None,
+        description="Set of trigger phrases for this model",
+    )
+    default_settings: LoraModelDefaultSettings | None = Field(
+        default=None,
+        description="Default settings for this model",
+    )
+
+
+def _get_flux_lora_format(mod: ModelOnDisk) -> FluxLoRAFormat | None:
+    # TODO(psyche): Moving this import to the function to avoid circular imports. Refactor later.
+    from invokeai.backend.patches.lora_conversions.formats import flux_format_from_state_dict
+
+    state_dict = mod.load_state_dict()
+    value = flux_format_from_state_dict(state_dict, mod.metadata())
+    return value
+
+
+# Matches an SDXL UNet attention key, capturing the transformer_blocks index.
+#
+# Anchored on the `lora_unet_` prefix because that is exactly the key set
+# `convert_sdxl_keys_to_diffusers_format()` can convert at load time — keys outside it
+# (e.g. diffusers/PEFT `unet.….lora_A.weight`) would be identified as SDXL here only to
+# raise `ValueError: Unrecognized SDXL LoRA key prefix` mid-generation.
+#
+# Both kohya `sd-scripts` naming conventions are covered: Stability-AI block names
+# (`input_blocks_8_1`, `middle_block_1`, `output_blocks_0_1`) and diffusers block names
+# (`down_blocks_2_attentions_1`, `mid_block_attentions_0`). Requiring a UNet block name
+# in addition to the prefix keeps DiT-style transformers (FLUX/Qwen/Z-Image), which also
+# use `transformer_blocks`, from matching.
+_SDXL_UNET_ATTENTION_RE = re.compile(
+    r"^lora_unet_"
+    r"(?:(?:down_blocks|up_blocks)_\d+_attentions_\d+"
+    r"|mid_block_attentions_\d+"
+    r"|(?:input_blocks|output_blocks)_\d+_\d+"
+    r"|middle_block_\d+)"
+    r"_transformer_blocks_(\d+)_"
+)
+
+
+def _state_dict_looks_like_sdxl_unet_lora(state_dict: dict[str | int, Any]) -> bool:
+    """Detect an SDXL UNet LoRA from its block structure alone.
+
+    SDXL's UNet uses a deep transformer stack (up to 10 transformer blocks) in its
+    lower-resolution attention blocks, so `transformer_blocks` indices reach >= 2.
+    SD1.x/SD2.x UNets only ever have a single transformer block (index 0) per
+    attention. This lets us identify SDXL from UNet-only LoRAs that lack the
+    cross-attention / text-encoder keys `lora_token_vector_length()` relies on
+    (e.g. self-attention-only "slider" LoRAs).
+
+    Known limitation: the `>= 2` threshold is what separates SDXL from SD1.x/SD2.x, so an
+    SDXL LoRA confined to the 2-transformer-block attention blocks (`down_blocks_1` /
+    `up_blocks_1`, indices 0-1) is not detected. Such a LoRA is indistinguishable from
+    SD1/SD2 by block structure alone.
+    """
+    for key in state_dict:
+        if not isinstance(key, str):
+            continue
+        match = _SDXL_UNET_ATTENTION_RE.match(key)
+        if match is not None and int(match.group(1)) >= 2:
+            return True
+    return False
+
+
+# FLUX.2 context_in_dim values (Klein 4B 7680 / Klein 9B 12288 / Dev 15360) come from the
+# shared dimension table so this "is it FLUX.2?" check can't drift from variant detection.
+_FLUX2_CONTEXT_IN_DIMS = FLUX2_CONTEXT_IN_DIMS
+
+# FLUX.2 vec_in_dim values: text encoder hidden_size
+# Klein 4B: 2560 (Qwen3-4B), Klein 9B: 4096 (Qwen3-8B), Dev: 5120 (Mistral Small 3)
+_FLUX2_VEC_IN_DIMS = {2560, 4096, 5120}
+
+# FLUX.1 hidden_size is 3072. Klein 9B uses 4096, FLUX.2 [dev] uses 6144 (48 heads × 128 head_dim).
+# Klein 4B also uses 3072, so hidden_size alone can't distinguish Klein 4B from FLUX.1.
+_FLUX1_HIDDEN_SIZE = 3072
+
+# FLUX.1 uses mlp_ratio=4 (ffn_dim=12288 for hidden_size=3072).
+# Klein 4B uses mlp_ratio=6 (ffn_dim=18432 for hidden_size=3072).
+_FLUX1_MLP_RATIO = 4
+
+# Trigger once per LyCORIS layer from its w1 entry; the dimension helpers resolve w2 independently.
+_LYCORIS_IN_DIM_SUFFIXES = (
+    ".lokr_w1",
+    ".lokr_w1_b",
+    ".hada_w1_b",
+)
+_LYCORIS_OUT_DIM_SUFFIXES = (
+    ".lokr_w1",
+    ".lokr_w1_a",
+    ".hada_w1_a",
+)
+_BFL_LYCORIS_ATTN_IN_SUFFIXES = tuple(f".img_attn.proj{suffix}" for suffix in _LYCORIS_IN_DIM_SUFFIXES)
+_BFL_LYCORIS_MLP_OUT_SUFFIXES = tuple(f".img_mlp.0{suffix}" for suffix in _LYCORIS_OUT_DIM_SUFFIXES)
+
+
+def _lokr_operand_dim(
+    state_dict: dict[str | int, Any],
+    key_prefix: str,
+    operand: Literal["w1", "w2"],
+    axis: Literal[0, 1],
+) -> int | None:
+    full_key = f"{key_prefix}.lokr_{operand}"
+    if full_key in state_dict:
+        return state_dict[full_key].shape[axis]
+
+    factor_key = f"{full_key}_{'a' if axis == 0 else 'b'}"
+    if factor_key not in state_dict:
+        return None
+    return state_dict[factor_key].shape[axis]
+
+
+def _lokr_in_dim(state_dict: dict[str | int, Any], key_prefix: str) -> int | None:
+    """Compute the input dimension of a LOKR layer: w1.shape[1] * w2.shape[1].
+
+    Each Kronecker operand may independently be stored whole or as an ``_a``/``_b`` factor pair.
+    """
+    w1_dim = _lokr_operand_dim(state_dict, key_prefix, "w1", 1)
+    w2_dim = _lokr_operand_dim(state_dict, key_prefix, "w2", 1)
+    if w1_dim is None or w2_dim is None:
+        return None
+    return w1_dim * w2_dim
+
+
+def _lokr_out_dim(state_dict: dict[str | int, Any], key_prefix: str) -> int | None:
+    """Compute the output dimension of a LOKR layer: w1.shape[0] * w2.shape[0].
+
+    Each Kronecker operand may independently be stored whole or as an ``_a``/``_b`` factor pair.
+    """
+    w1_dim = _lokr_operand_dim(state_dict, key_prefix, "w1", 0)
+    w2_dim = _lokr_operand_dim(state_dict, key_prefix, "w2", 0)
+    if w1_dim is None or w2_dim is None:
+        return None
+    return w1_dim * w2_dim
+
+
+def _loha_dim(state_dict: dict[str | int, Any], key_prefix: str, axis: Literal[0, 1]) -> int | None:
+    factor = "a" if axis == 0 else "b"
+    w1_key = f"{key_prefix}.hada_w1_{factor}"
+    w2_key = f"{key_prefix}.hada_w2_{factor}"
+    if w1_key not in state_dict or w2_key not in state_dict:
+        return None
+    w1_dim = state_dict[w1_key].shape[axis]
+    w2_dim = state_dict[w2_key].shape[axis]
+    return w1_dim if w1_dim == w2_dim else None
+
+
+def _lycoris_in_dim(state_dict: dict[str | int, Any], key_prefix: str) -> int | None:
+    lokr_dim = _lokr_in_dim(state_dict, key_prefix)
+    return lokr_dim if lokr_dim is not None else _loha_dim(state_dict, key_prefix, 1)
+
+
+def _lycoris_out_dim(state_dict: dict[str | int, Any], key_prefix: str) -> int | None:
+    lokr_dim = _lokr_out_dim(state_dict, key_prefix)
+    return lokr_dim if lokr_dim is not None else _loha_dim(state_dict, key_prefix, 0)
+
+
+def _is_flux2_lora(mod: ModelOnDisk) -> bool:
+    """Check if a FLUX-format LoRA is specifically for FLUX.2 (Klein) rather than FLUX.1.
+
+    Detection is based on:
+    1. Tensor shapes of embedding layers (context_embedder, vector_in) that differ between FLUX.1 and FLUX.2
+    2. Hidden size of attention layers (3072 for FLUX.1/Klein 4B, 4096 for Klein 9B)
+
+    Returns False for ambiguous LoRAs (e.g. Klein 4B transformer-only LoRAs with no distinguishing layers).
+    """
+    state_dict = mod.load_state_dict()
+    return _is_flux2_lora_state_dict(state_dict)
+
+
+def _is_flux2_lora_state_dict(state_dict: dict[str | int, Any]) -> bool:
+    """Check state dict tensor shapes for FLUX.2 Klein-specific dimensions."""
+    # Check diffusers/PEFT format keys (with various prefixes).
+    # This covers both Flux.1 diffusers naming AND Flux2 Klein diffusers naming.
+    for prefix in ["transformer.", "base_model.model.", ""]:
+        # Check context_embedder (txt_in) dimensions
+        # FLUX.1: context_in_dim=4096, FLUX.2 Klein 4B: 7680, Klein 9B: 12288
+        ctx_key_a = f"{prefix}context_embedder.lora_A.weight"
+        if ctx_key_a in state_dict:
+            return state_dict[ctx_key_a].shape[1] in _FLUX2_CONTEXT_IN_DIMS
+
+        # Check vector_in (time_text_embed.text_embedder) dimensions
+        # FLUX.1: vec_in_dim=768, FLUX.2 Klein 4B: 2560, Klein 9B: 4096
+        vec_key_a = f"{prefix}time_text_embed.text_embedder.linear_1.lora_A.weight"
+        if vec_key_a in state_dict:
+            return state_dict[vec_key_a].shape[1] in _FLUX2_VEC_IN_DIMS
+
+        # Check Flux2 Klein diffusers naming: fused QKV+MLP in single blocks.
+        # This key only exists in Flux2 models (Flux.1 uses separate to_q/to_k/to_v + proj_mlp).
+        fused_key_a = f"{prefix}single_transformer_blocks.0.attn.to_qkv_mlp_proj.lora_A.weight"
+        if fused_key_a in state_dict:
+            return True
+
+        # Check Flux2 Klein diffusers naming: ff.linear_in (Flux.1 uses ff.net.0.proj).
+        ff_key_a = f"{prefix}transformer_blocks.0.ff.linear_in.lora_A.weight"
+        if ff_key_a in state_dict:
+            return True
+
+    # Check BFL PEFT format (diffusion_model.* or base_model.model.* prefix with BFL layer names).
+    # Klein 9B has hidden_size=4096 (vs 3072 for FLUX.1 and Klein 4B).
+    # Klein 4B has same hidden_size as FLUX.1 (3072) but different mlp_ratio (6 vs 4),
+    # and different txt_in/vector_in dimensions.
+    _bfl_prefixes = ("diffusion_model.", "base_model.model.")
+    bfl_hidden_size: int | None = None
+    for key in state_dict:
+        if not isinstance(key, str):
+            continue
+        if not key.startswith(_bfl_prefixes):
+            continue
+
+        # BFL PEFT: attention projection → check hidden_size
+        if key.endswith(".img_attn.proj.lora_A.weight"):
+            bfl_hidden_size = state_dict[key].shape[1]
+            if bfl_hidden_size != _FLUX1_HIDDEN_SIZE:
+                return True
+            # hidden_size=3072 is ambiguous (could be Klein 4B or FLUX.1), keep checking
+
+        # BFL PEFT: context_embedder/txt_in
+        elif "txt_in" in key and key.endswith("lora_A.weight"):
+            return state_dict[key].shape[1] in _FLUX2_CONTEXT_IN_DIMS
+
+        # BFL PEFT: vector_in
+        elif "vector_in" in key and key.endswith("lora_A.weight"):
+            return state_dict[key].shape[1] in _FLUX2_VEC_IN_DIMS
+
+        # BFL LyCORIS: attention projection → check hidden_size from the reconstructed layer dimensions
+        elif key.endswith(_BFL_LYCORIS_ATTN_IN_SUFFIXES):
+            layer_prefix = key.rsplit(".", 1)[0]
+            in_dim = _lycoris_in_dim(state_dict, layer_prefix)
+            if in_dim is not None:
+                if in_dim != _FLUX1_HIDDEN_SIZE:
+                    return True
+                bfl_hidden_size = in_dim  # ambiguous, keep checking
+
+        # BFL LyCORIS: context_embedder/txt_in
+        elif "txt_in" in key and key.endswith(_LYCORIS_IN_DIM_SUFFIXES):
+            layer_prefix = key.rsplit(".", 1)[0]
+            in_dim = _lycoris_in_dim(state_dict, layer_prefix)
+            if in_dim is not None:
+                return in_dim in _FLUX2_CONTEXT_IN_DIMS
+
+        # BFL LyCORIS: vector_in
+        elif "vector_in" in key and key.endswith(_LYCORIS_IN_DIM_SUFFIXES):
+            layer_prefix = key.rsplit(".", 1)[0]
+            in_dim = _lycoris_in_dim(state_dict, layer_prefix)
+            if in_dim is not None:
+                return in_dim in _FLUX2_VEC_IN_DIMS
+
+    # BFL PEFT/LyCORIS: hidden_size matches FLUX.1. Check MLP ratio to distinguish Klein 4B.
+    # Klein 4B uses mlp_ratio=6 (ffn_dim=18432), FLUX.1 uses mlp_ratio=4 (ffn_dim=12288).
+    if bfl_hidden_size == _FLUX1_HIDDEN_SIZE:
+        for key in state_dict:
+            if not isinstance(key, str):
+                continue
+            if key.startswith(_bfl_prefixes) and key.endswith(".img_mlp.0.lora_B.weight"):
+                ffn_dim = state_dict[key].shape[0]
+                if ffn_dim != bfl_hidden_size * _FLUX1_MLP_RATIO:
+                    return True
+                break
+            # BFL LyCORIS: check output dim of img_mlp.0
+            if key.startswith(_bfl_prefixes) and key.endswith(_BFL_LYCORIS_MLP_OUT_SUFFIXES):
+                layer_prefix = key.rsplit(".", 1)[0]
+                out_dim = _lycoris_out_dim(state_dict, layer_prefix)
+                if out_dim is not None and out_dim != bfl_hidden_size * _FLUX1_MLP_RATIO:
+                    return True
+                break
+
+    # Check kohya format: look for context_embedder or vector_in keys
+    # Kohya format uses lora_unet_ prefix with underscores instead of dots
+    for key in state_dict:
+        if not isinstance(key, str):
+            continue
+        if key.startswith("lora_unet_txt_in.") or key.startswith("lora_unet_context_embedder."):
+            if key.endswith("lora_down.weight"):
+                return state_dict[key].shape[1] in _FLUX2_CONTEXT_IN_DIMS
+            # Kohya LyCORIS
+            elif key.endswith(_LYCORIS_IN_DIM_SUFFIXES):
+                layer_prefix = key.rsplit(".", 1)[0]
+                in_dim = _lycoris_in_dim(state_dict, layer_prefix)
+                if in_dim is not None:
+                    return in_dim in _FLUX2_CONTEXT_IN_DIMS
+        if key.startswith("lora_unet_vector_in.") or key.startswith("lora_unet_time_text_embed_text_embedder_"):
+            if key.endswith("lora_down.weight"):
+                return state_dict[key].shape[1] in _FLUX2_VEC_IN_DIMS
+            # Kohya LyCORIS
+            elif key.endswith(_LYCORIS_IN_DIM_SUFFIXES):
+                layer_prefix = key.rsplit(".", 1)[0]
+                in_dim = _lycoris_in_dim(state_dict, layer_prefix)
+                if in_dim is not None:
+                    return in_dim in _FLUX2_VEC_IN_DIMS
+
+    # Kohya format: check transformer block dimensions (hidden_size and MLP ratio).
+    # This handles LoRAs that only target transformer blocks (no txt_in/vector_in/context_embedder).
+    # Klein 9B has hidden_size=4096 (vs 3072 for FLUX.1 and Klein 4B).
+    # Klein 4B has same hidden_size as FLUX.1 (3072) but different mlp_ratio (6 vs 4).
+    kohya_hidden_size: int | None = None
+    for key in state_dict:
+        if not isinstance(key, str):
+            continue
+        if not key.startswith("lora_unet_"):
+            continue
+
+        # Check img_attn_proj hidden_size
+        if "_img_attn_proj." in key and key.endswith("lora_down.weight"):
+            kohya_hidden_size = state_dict[key].shape[1]
+            if kohya_hidden_size != _FLUX1_HIDDEN_SIZE:
+                return True
+            break
+        # LyCORIS variant
+        elif "_img_attn_proj." in key and key.endswith(_LYCORIS_IN_DIM_SUFFIXES):
+            layer_prefix = key.rsplit(".", 1)[0]
+            in_dim = _lycoris_in_dim(state_dict, layer_prefix)
+            if in_dim is not None:
+                if in_dim != _FLUX1_HIDDEN_SIZE:
+                    return True
+                kohya_hidden_size = in_dim
+            break
+
+    # Kohya format: hidden_size matches FLUX.1. Check MLP ratio to distinguish Klein 4B.
+    # Klein 4B uses mlp_ratio=6 (ffn_dim=18432), FLUX.1 uses mlp_ratio=4 (ffn_dim=12288).
+    if kohya_hidden_size == _FLUX1_HIDDEN_SIZE:
+        for key in state_dict:
+            if not isinstance(key, str):
+                continue
+            if key.startswith("lora_unet_") and "_img_mlp_0." in key and key.endswith("lora_up.weight"):
+                ffn_dim = state_dict[key].shape[0]
+                if ffn_dim != kohya_hidden_size * _FLUX1_MLP_RATIO:
+                    return True
+                break
+            # LyCORIS variant
+            if key.startswith("lora_unet_") and "_img_mlp_0." in key and key.endswith(_LYCORIS_OUT_DIM_SUFFIXES):
+                layer_prefix = key.rsplit(".", 1)[0]
+                out_dim = _lycoris_out_dim(state_dict, layer_prefix)
+                if out_dim is not None and out_dim != kohya_hidden_size * _FLUX1_MLP_RATIO:
+                    return True
+                break
+
+    return False
+
+
+def _get_flux2_lora_variant(state_dict: dict[str | int, Any]) -> Flux2VariantType | None:
+    """Determine FLUX.2 variant (Klein 4B/9B or Dev) from a LoRA state dict.
+
+    Detection is based on tensor dimensions that differ between variants:
+    - hidden_size from attention projection: 3072 = Klein 4B, 4096 = Klein 9B, 6144 = Dev
+    - context_in_dim from context embedder: 7680 = Klein 4B, 12288 = Klein 9B, 15360 = Dev
+    - vec_in_dim from vector embedder: 2560 = Klein 4B, 4096 = Klein 9B, 5120 = Dev
+
+    Returns None if the variant cannot be determined (e.g. LoRA only targets layers
+    with identical dimensions across variants).
+    """
+    # Reverse-lookup helpers come from the shared FLUX.2 dimension table (single source of
+    # truth shared with main.py's identification code). Aliased to the original local names
+    # to keep the detection code below unchanged.
+    _variant_from_context_dim = flux2_variant_from_context_dim
+    _variant_from_vec_dim = flux2_variant_from_vec_dim
+    _variant_from_hidden_size = flux2_variant_from_hidden_size
+
+    # Check diffusers/PEFT format keys
+    for prefix in ["transformer.", "base_model.model.", ""]:
+        # Context embedder (txt_in) dimensions
+        ctx_key_a = f"{prefix}context_embedder.lora_A.weight"
+        if ctx_key_a in state_dict:
+            return _variant_from_context_dim(state_dict[ctx_key_a].shape[1])
+
+        # Vector embedder dimensions
+        vec_key_a = f"{prefix}time_text_embed.text_embedder.linear_1.lora_A.weight"
+        if vec_key_a in state_dict:
+            return _variant_from_vec_dim(state_dict[vec_key_a].shape[1])
+
+        # Attention projection hidden_size (Flux.1 diffusers naming)
+        attn_key_a = f"{prefix}transformer_blocks.0.attn.to_out.0.lora_A.weight"
+        if attn_key_a in state_dict:
+            return _variant_from_hidden_size(state_dict[attn_key_a].shape[1])
+
+        # Attention projection hidden_size (Flux2 diffusers naming)
+        attn_key_a2 = f"{prefix}transformer_blocks.0.attn.to_add_out.lora_A.weight"
+        if attn_key_a2 in state_dict:
+            return _variant_from_hidden_size(state_dict[attn_key_a2].shape[1])
+
+        # Fused QKV+MLP hidden_size (Flux2 diffusers naming)
+        fused_key_a = f"{prefix}single_transformer_blocks.0.attn.to_qkv_mlp_proj.lora_A.weight"
+        if fused_key_a in state_dict:
+            return _variant_from_hidden_size(state_dict[fused_key_a].shape[1])
+
+    # Check BFL PEFT/LyCORIS format (diffusion_model.* or base_model.model.* prefix with BFL names)
+    _bfl_prefixes = ("diffusion_model.", "base_model.model.")
+    for key in state_dict:
+        if not isinstance(key, str):
+            continue
+        if not key.startswith(_bfl_prefixes):
+            continue
+
+        # BFL PEFT: context embedder (txt_in)
+        if "txt_in" in key and key.endswith("lora_A.weight"):
+            return _variant_from_context_dim(state_dict[key].shape[1])
+
+        # BFL PEFT: vector embedder (vector_in)
+        if "vector_in" in key and key.endswith("lora_A.weight"):
+            return _variant_from_vec_dim(state_dict[key].shape[1])
+
+        # BFL PEFT: attention projection
+        if key.endswith(".img_attn.proj.lora_A.weight"):
+            return _variant_from_hidden_size(state_dict[key].shape[1])
+
+        # BFL LyCORIS: context embedder (txt_in)
+        if "txt_in" in key and key.endswith(_LYCORIS_IN_DIM_SUFFIXES):
+            in_dim = _lycoris_in_dim(state_dict, key.rsplit(".", 1)[0])
+            if in_dim is not None:
+                return _variant_from_context_dim(in_dim)
+
+        # BFL LyCORIS: vector embedder (vector_in)
+        if "vector_in" in key and key.endswith(_LYCORIS_IN_DIM_SUFFIXES):
+            in_dim = _lycoris_in_dim(state_dict, key.rsplit(".", 1)[0])
+            if in_dim is not None:
+                return _variant_from_vec_dim(in_dim)
+
+        # BFL LyCORIS: attention projection
+        if key.endswith(_BFL_LYCORIS_ATTN_IN_SUFFIXES):
+            in_dim = _lycoris_in_dim(state_dict, key.rsplit(".", 1)[0])
+            if in_dim is not None:
+                return _variant_from_hidden_size(in_dim)
+
+    # Check kohya format
+    for key in state_dict:
+        if not isinstance(key, str):
+            continue
+        if key.startswith("lora_unet_txt_in.") or key.startswith("lora_unet_context_embedder."):
+            if key.endswith("lora_down.weight"):
+                return _variant_from_context_dim(state_dict[key].shape[1])
+            # Kohya LyCORIS
+            elif key.endswith(_LYCORIS_IN_DIM_SUFFIXES):
+                in_dim = _lycoris_in_dim(state_dict, key.rsplit(".", 1)[0])
+                if in_dim is not None:
+                    return _variant_from_context_dim(in_dim)
+        if key.startswith("lora_unet_vector_in.") or key.startswith("lora_unet_time_text_embed_text_embedder_"):
+            if key.endswith("lora_down.weight"):
+                return _variant_from_vec_dim(state_dict[key].shape[1])
+            # Kohya LyCORIS
+            elif key.endswith(_LYCORIS_IN_DIM_SUFFIXES):
+                in_dim = _lycoris_in_dim(state_dict, key.rsplit(".", 1)[0])
+                if in_dim is not None:
+                    return _variant_from_vec_dim(in_dim)
+
+    # Kohya format: check transformer block dimensions (hidden_size from img_attn_proj).
+    # This handles LoRAs that only target transformer blocks (no txt_in/vector_in/context_embedder).
+    for key in state_dict:
+        if not isinstance(key, str):
+            continue
+        if not key.startswith("lora_unet_"):
+            continue
+
+        # Check img_attn_proj hidden_size
+        if "_img_attn_proj." in key and key.endswith("lora_down.weight"):
+            return _variant_from_hidden_size(state_dict[key].shape[1])
+        # LyCORIS variant
+        elif "_img_attn_proj." in key and key.endswith(_LYCORIS_IN_DIM_SUFFIXES):
+            in_dim = _lycoris_in_dim(state_dict, key.rsplit(".", 1)[0])
+            if in_dim is not None:
+                return _variant_from_hidden_size(in_dim)
+
+    return None
+
+
+class LoRA_OMI_Config_Base(LoRA_Config_Base):
+    format: Literal[ModelFormat.OMI] = Field(default=ModelFormat.OMI)
+
+    @classmethod
+    def from_model_on_disk(cls, mod: ModelOnDisk, override_fields: dict[str, Any]) -> Self:
+        raise_if_not_file(mod)
+
+        raise_for_override_fields(cls, override_fields)
+
+        cls._validate_looks_like_omi_lora(mod)
+
+        cls._validate_base(mod)
+
+        return cls(**override_fields)
+
+    @classmethod
+    def _validate_base(cls, mod: ModelOnDisk) -> None:
+        """Raise `NotAMatch` if the model base does not match this config class."""
+        expected_base = cls.model_fields["base"].default
+        recognized_base = cls._get_base_or_raise(mod)
+        if expected_base is not recognized_base:
+            raise NotAMatchError(f"base is {recognized_base}, not {expected_base}")
+
+    @classmethod
+    def _validate_looks_like_omi_lora(cls, mod: ModelOnDisk) -> None:
+        """Raise `NotAMatch` if the model metadata does not look like an OMI LoRA."""
+        flux_format = _get_flux_lora_format(mod)
+        if flux_format in [FluxLoRAFormat.Control, FluxLoRAFormat.Diffusers]:
+            raise NotAMatchError("model looks like ControlLoRA or Diffusers LoRA")
+
+        metadata = mod.metadata()
+
+        metadata_looks_like_omi_lora = (
+            bool(metadata.get("modelspec.sai_model_spec"))
+            and metadata.get("ot_branch") == "omi_format"
+            and metadata.get("modelspec.architecture", "").split("/")[1].lower() == "lora"
+        )
+
+        if not metadata_looks_like_omi_lora:
+            raise NotAMatchError("metadata does not look like OMI LoRA")
+
+    @classmethod
+    def _get_base_or_raise(cls, mod: ModelOnDisk) -> Literal[BaseModelType.Flux, BaseModelType.StableDiffusionXL]:
+        metadata = mod.metadata()
+        architecture = metadata["modelspec.architecture"]
+
+        if architecture == stable_diffusion_xl_1_lora:
+            return BaseModelType.StableDiffusionXL
+        elif architecture == flux_dev_1_lora:
+            return BaseModelType.Flux
+        else:
+            raise NotAMatchError(f"unrecognised/unsupported architecture for OMI LoRA: {architecture}")
+
+
+class LoRA_OMI_SDXL_Config(LoRA_OMI_Config_Base, Config_Base):
+    base: Literal[BaseModelType.StableDiffusionXL] = Field(default=BaseModelType.StableDiffusionXL)
+
+
+class LoRA_OMI_FLUX_Config(LoRA_OMI_Config_Base, Config_Base):
+    base: Literal[BaseModelType.Flux] = Field(default=BaseModelType.Flux)
+
+
+class LoRA_LyCORIS_Config_Base(LoRA_Config_Base):
+    """Model config for LoRA/Lycoris models."""
+
+    type: Literal[ModelType.LoRA] = Field(default=ModelType.LoRA)
+    format: Literal[ModelFormat.LyCORIS] = Field(default=ModelFormat.LyCORIS)
+
+    @classmethod
+    def from_model_on_disk(cls, mod: ModelOnDisk, override_fields: dict[str, Any]) -> Self:
+        raise_if_not_file(mod)
+
+        raise_for_override_fields(cls, override_fields)
+
+        cls._validate_looks_like_lora(mod)
+
+        cls._validate_base(mod)
+
+        return cls(**override_fields)
+
+    @classmethod
+    def _validate_base(cls, mod: ModelOnDisk) -> None:
+        """Raise `NotAMatch` if the model base does not match this config class."""
+        expected_base = cls.model_fields["base"].default
+        recognized_base = cls._get_base_or_raise(mod)
+        if expected_base is not recognized_base:
+            raise NotAMatchError(f"base is {recognized_base}, not {expected_base}")
+
+    @classmethod
+    def _validate_looks_like_lora(cls, mod: ModelOnDisk) -> None:
+        # First rule out ControlLoRA
+        flux_format = _get_flux_lora_format(mod)
+        if flux_format in [FluxLoRAFormat.Control]:
+            raise NotAMatchError("model looks like Control LoRA")
+
+        # If it's a recognized Flux LoRA format (Kohya, Diffusers, OneTrainer, AIToolkit, XLabs, etc.),
+        # it's valid and we skip the heuristic check
+        if flux_format is not None:
+            return
+
+        # Note: Existence of these key prefixes/suffixes does not guarantee that this is a LoRA.
+        # Some main models have these keys, likely due to the creator merging in a LoRA.
+        has_key_with_lora_prefix = state_dict_has_any_keys_starting_with(
+            mod.load_state_dict(),
+            {
+                "lora_te_",
+                "lora_unet_",
+                "lora_te1_",
+                "lora_te2_",
+                "lora_transformer_",
+            },
+        )
+
+        has_key_with_lora_suffix = state_dict_has_any_keys_ending_with(
+            mod.load_state_dict(),
+            {
+                "to_k_lora.up.weight",
+                "to_q_lora.down.weight",
+                "lora_A.weight",
+                "lora_B.weight",
+                # LyCORIS LoKR suffixes
+                "lokr_w1",
+                "lokr_w2",
+                # LyCORIS LoHA suffixes
+                "hada_w1_a",
+                "hada_w2_a",
+            },
+        )
+
+        if not has_key_with_lora_prefix and not has_key_with_lora_suffix:
+            raise NotAMatchError("model does not match LyCORIS LoRA heuristics")
+
+    @classmethod
+    def _get_base_or_raise(cls, mod: ModelOnDisk) -> BaseModelType:
+        if _get_flux_lora_format(mod):
+            if _is_flux2_lora(mod):
+                return BaseModelType.Flux2
+            return BaseModelType.Flux
+
+        state_dict = mod.load_state_dict()
+        str_keys = [k for k in state_dict.keys() if isinstance(k, str)]
+
+        # Rule out Anima LoRAs — their lora_te_ keys have shapes that
+        # lora_token_vector_length() misidentifies as SD2/SDXL.
+        if has_cosmos_dit_kohya_keys(str_keys) or has_cosmos_dit_peft_keys(str_keys):
+            raise NotAMatchError("model looks like an Anima LoRA, not a Stable Diffusion LoRA")
+
+        # If we've gotten here, we assume that the model is a Stable Diffusion model
+        token_vector_length = lora_token_vector_length(state_dict)
+        if token_vector_length == 768:
+            return BaseModelType.StableDiffusion1
+        elif token_vector_length == 1024:
+            return BaseModelType.StableDiffusion2
+        elif token_vector_length == 1280:
+            return BaseModelType.StableDiffusionXL  # recognizes format at https://civitai.com/models/224641
+        elif token_vector_length == 2048:
+            return BaseModelType.StableDiffusionXL
+        # Some SDXL LoRAs (e.g. self-attention-only "slider" LoRAs) target only the UNet
+        # and lack the cross-attention / text-encoder keys that lora_token_vector_length()
+        # needs. Fall back to detecting SDXL from the UNet's deep transformer-block structure.
+        elif _state_dict_looks_like_sdxl_unet_lora(state_dict):
+            return BaseModelType.StableDiffusionXL
+        else:
+            raise NotAMatchError(f"unrecognized token vector length {token_vector_length}")
+
+
+class LoRA_LyCORIS_SD1_Config(LoRA_LyCORIS_Config_Base, Config_Base):
+    base: Literal[BaseModelType.StableDiffusion1] = Field(default=BaseModelType.StableDiffusion1)
+
+
+class LoRA_LyCORIS_SD2_Config(LoRA_LyCORIS_Config_Base, Config_Base):
+    base: Literal[BaseModelType.StableDiffusion2] = Field(default=BaseModelType.StableDiffusion2)
+
+
+class LoRA_LyCORIS_SDXL_Config(LoRA_LyCORIS_Config_Base, Config_Base):
+    base: Literal[BaseModelType.StableDiffusionXL] = Field(default=BaseModelType.StableDiffusionXL)
+
+
+class LoRA_LyCORIS_FLUX_Config(LoRA_LyCORIS_Config_Base, Config_Base):
+    base: Literal[BaseModelType.Flux] = Field(default=BaseModelType.Flux)
+
+
+class LoRA_LyCORIS_Flux2_Config(LoRA_LyCORIS_Config_Base, Config_Base):
+    """Model config for FLUX.2 (Klein) LoRA models in LyCORIS format."""
+
+    base: Literal[BaseModelType.Flux2] = Field(default=BaseModelType.Flux2)
+    variant: Flux2VariantType | None = Field(default=None)
+
+    @classmethod
+    def from_model_on_disk(cls, mod: ModelOnDisk, override_fields: dict[str, Any]) -> Self:
+        raise_if_not_file(mod)
+        raise_for_override_fields(cls, override_fields)
+        cls._validate_looks_like_lora(mod)
+        cls._validate_base(mod)
+        override_fields.setdefault("variant", _get_flux2_lora_variant(mod.load_state_dict()))
+        return cls(**override_fields)
+
+    @classmethod
+    def _get_base_or_raise(cls, mod: ModelOnDisk) -> BaseModelType:
+        if _get_flux_lora_format(mod) and _is_flux2_lora(mod):
+            return BaseModelType.Flux2
+        raise NotAMatchError("model is not a FLUX.2 LoRA")
+
+
+class LoRA_LyCORIS_ZImage_Config(LoRA_LyCORIS_Config_Base, Config_Base):
+    """Model config for Z-Image LoRA models in LyCORIS format."""
+
+    base: Literal[BaseModelType.ZImage] = Field(default=BaseModelType.ZImage)
+    variant: ZImageVariantType | None = Field(default=None)
+
+    @classmethod
+    def _validate_looks_like_lora(cls, mod: ModelOnDisk) -> None:
+        """Z-Image LoRAs have different key patterns than SD/SDXL LoRAs.
+
+        Z-Image LoRAs use keys like:
+        - diffusion_model.layers.X.attention.to_k.lora_down.weight (DoRA format)
+        - diffusion_model.layers.X.attention.to_k.lora_A.weight (PEFT format)
+        - diffusion_model.layers.X.attention.to_k.dora_scale (DoRA scale)
+        - lora_unet__layers_X_attention_to_k.lora_down.weight (Kohya format)
+        """
+        from invokeai.backend.patches.lora_conversions.z_image_lora_conversion_utils import (
+            is_state_dict_likely_z_image_kohya_lora,
+        )
+
+        state_dict = mod.load_state_dict()
+
+        # Check for Kohya format first
+        if is_state_dict_likely_z_image_kohya_lora(state_dict):
+            return
+
+        # Check for Z-Image specific LoRA patterns (dot-notation formats)
+        has_z_image_lora_keys = state_dict_has_any_keys_starting_with(
+            state_dict,
+            {
+                "diffusion_model.layers.",  # Z-Image S3-DiT layer pattern
+                "diffusion_model.context_refiner.",
+                "diffusion_model.noise_refiner.",
+                "transformer.layers.",  # OneTrainer/diffusers prefix variant
+                "base_model.model.transformer.layers.",  # PEFT-wrapped variant
+            },
+        )
+
+        # Also check for LoRA weight suffixes (various formats)
+        has_lora_suffix = state_dict_has_any_keys_ending_with(
+            state_dict,
+            {
+                "lora_A.weight",
+                "lora_B.weight",
+                "lora_down.weight",
+                "lora_up.weight",
+                "dora_scale",
+            },
+        )
+
+        if has_z_image_lora_keys and has_lora_suffix:
+            return
+
+        raise NotAMatchError("model does not match Z-Image LoRA heuristics")
+
+    @classmethod
+    def _get_base_or_raise(cls, mod: ModelOnDisk) -> BaseModelType:
+        """Z-Image LoRAs are identified by their diffusion_model.layers structure.
+
+        Z-Image uses S3-DiT architecture with layer names like:
+        - diffusion_model.layers.0.attention.to_k.lora_A.weight
+        - diffusion_model.layers.0.feed_forward.w1.lora_A.weight
+        - lora_unet__layers_0_attention_to_k.lora_down.weight (Kohya format)
+        """
+        from invokeai.backend.patches.lora_conversions.z_image_lora_conversion_utils import (
+            is_state_dict_likely_z_image_kohya_lora,
+        )
+
+        state_dict = mod.load_state_dict()
+
+        # Check for Kohya format
+        if is_state_dict_likely_z_image_kohya_lora(state_dict):
+            return BaseModelType.ZImage
+
+        # Check for Z-Image transformer layer patterns (dot-notation formats)
+        # Z-Image uses diffusion_model.layers.X structure (unlike Flux which uses double_blocks/single_blocks)
+        has_z_image_keys = state_dict_has_any_keys_starting_with(
+            state_dict,
+            {
+                "diffusion_model.layers.",  # Z-Image S3-DiT layer pattern
+                "diffusion_model.context_refiner.",
+                "diffusion_model.noise_refiner.",
+                "transformer.layers.",  # OneTrainer/diffusers prefix variant
+                "base_model.model.transformer.layers.",  # PEFT-wrapped variant
+            },
+        )
+
+        # If it looks like a Z-Image LoRA, return ZImage base
+        if has_z_image_keys:
+            return BaseModelType.ZImage
+
+        raise NotAMatchError("model does not look like a Z-Image LoRA")
+
+
+# ComfyUI's `diffusion_model.` and raw PEFT's `base_model.model.` also prefix other families' LoRAs, some of them on
+# `transformer_blocks.N` (LTX-2) or on Qwen-Image's attention names (FLUX in diffusers naming). Under these prefixes,
+# only low-rank weights on modules that Qwen-Image's dual-stream blocks alone have identify a Qwen-Image LoRA:
+# Qwen-Image-2.1 names its MLP `img_mlp.proj`, and the converter cannot group dotted LoKr keys.
+_PREFIXED_QWEN_IMAGE_BLOCK_KEY_RE = re.compile(
+    r"^(?:diffusion_model|base_model\.model)\.transformer_blocks\.\d+\.(?:img_mod|txt_mod|img_mlp\.net|txt_mlp)\."
+    r".*\.(?:lora_A|lora_B|lora_down|lora_up)\.weight$"
+)
+
+
+def _has_prefixed_qwen_image_lora_keys(state_dict: dict[str | int, Any]) -> bool:
+    keys = [key for key in state_dict if isinstance(key, str)]
+    # PEFT DoRA magnitudes are not mapped yet (#9558): the converter would fail on every generation.
+    if any(key.endswith(".lora_magnitude_vector") for key in keys):
+        return False
+    return any(_PREFIXED_QWEN_IMAGE_BLOCK_KEY_RE.match(key) for key in keys)
+
+
+class LoRA_LyCORIS_QwenImage_Config(LoRA_LyCORIS_Config_Base, Config_Base):
+    """Model config for Qwen Image Edit LoRA models in LyCORIS format."""
+
+    base: Literal[BaseModelType.QwenImage] = Field(default=BaseModelType.QwenImage)
+
+    @classmethod
+    def _validate_looks_like_lora(cls, mod: ModelOnDisk) -> None:
+        """Qwen Image Edit LoRAs have keys like transformer_blocks.X.attn.to_k.lora_down.weight."""
+        state_dict = mod.load_state_dict()
+
+        has_qwen_ie_keys = state_dict_has_any_keys_starting_with(
+            state_dict,
+            {
+                "transformer_blocks.",
+                "transformer.transformer_blocks.",
+                "lora_unet_transformer_blocks_",  # Kohya format
+            },
+        ) or _has_prefixed_qwen_image_lora_keys(state_dict)
+        has_lora_suffix = state_dict_has_any_keys_ending_with(
+            state_dict,
+            {
+                "lora_A.weight",
+                "lora_B.weight",
+                "lora_down.weight",
+                "lora_up.weight",
+                "dora_scale",
+                "lokr_w1",
+                "lokr_w2",  # LoKR format
+            },
+        )
+        # Must NOT have diffusion_model.layers (Z-Image) or Flux-style keys.
+        # Flux LoRAs can have transformer.single_transformer_blocks or transformer.transformer_blocks
+        # (with the "transformer." prefix and "single_" variant) which would falsely match our check.
+        # Flux Kohya LoRAs use lora_unet_double_blocks or lora_unet_single_blocks.
+        has_z_image_keys = state_dict_has_any_keys_starting_with(state_dict, {"diffusion_model.layers."})
+        # Krea-2 LoRAs also carry transformer.transformer_blocks. keys, but uniquely include the
+        # text-fusion stage. Exclude them here so they route to LoRA_LyCORIS_Krea2_Config.
+        has_krea2_keys = _has_krea2_lora_keys(state_dict)
+        str_keys = [key for key in state_dict if isinstance(key, str)]
+        has_anima_keys = has_cosmos_dit_peft_keys_strict(str_keys)
+        has_flux_keys = state_dict_has_any_keys_starting_with(
+            state_dict,
+            {
+                "double_blocks.",
+                "single_blocks.",
+                "single_transformer_blocks.",
+                "transformer.single_transformer_blocks.",
+                "lora_unet_double_blocks_",
+                "lora_unet_single_blocks_",
+                "lora_unet_single_transformer_blocks_",
+            },
+        )
+
+        if (
+            has_qwen_ie_keys
+            and has_lora_suffix
+            and not has_z_image_keys
+            and not has_krea2_keys
+            and not has_anima_keys
+            and not has_flux_keys
+            and not _has_qwen_image21_lora_keys(state_dict)
+            and not _has_ltx2_lora_keys(state_dict)
+        ):
+            return
+
+        raise NotAMatchError("model does not match Qwen Image LoRA heuristics")
+
+    @classmethod
+    def _get_base_or_raise(cls, mod: ModelOnDisk) -> BaseModelType:
+        state_dict = mod.load_state_dict()
+        has_qwen_ie_keys = state_dict_has_any_keys_starting_with(
+            state_dict,
+            {"transformer_blocks.", "transformer.transformer_blocks.", "lora_unet_transformer_blocks_"},
+        ) or _has_prefixed_qwen_image_lora_keys(state_dict)
+        has_z_image_keys = state_dict_has_any_keys_starting_with(state_dict, {"diffusion_model.layers."})
+        has_krea2_keys = _has_krea2_lora_keys(state_dict)
+        str_keys = [key for key in state_dict if isinstance(key, str)]
+        has_anima_keys = has_cosmos_dit_peft_keys_strict(str_keys)
+        has_flux_keys = state_dict_has_any_keys_starting_with(
+            state_dict,
+            {
+                "double_blocks.",
+                "single_blocks.",
+                "single_transformer_blocks.",
+                "transformer.single_transformer_blocks.",
+                "lora_unet_double_blocks_",
+                "lora_unet_single_blocks_",
+                "lora_unet_single_transformer_blocks_",
+            },
+        )
+
+        if (
+            has_qwen_ie_keys
+            and not has_z_image_keys
+            and not has_krea2_keys
+            and not has_anima_keys
+            and not has_flux_keys
+            and not _has_qwen_image21_lora_keys(state_dict)
+            and not _has_ltx2_lora_keys(state_dict)
+        ):
+            return BaseModelType.QwenImage
+        raise NotAMatchError("model does not look like a Qwen Image Edit LoRA")
+
+
+def _has_ltx2_lora_keys(state_dict: dict[str | int, Any]) -> bool:
+    # LTX-2's published LoRAs, unprefixed or under `transformer.`, also start with `transformer_blocks.`; only its
+    # audio and cross-modal towers tell them apart, and without this both Qwen Image and LTX-2 would claim them.
+    return has_ltx2_lora_keys([key for key in state_dict if isinstance(key, str)])
+
+
+_QWEN_IMAGE21_HIDDEN_SIZE = 4096
+# Qwen-Image-2.1's gated MLP, by any of its names: diffusers' `gate_layer`/`proj`/`out`, ComfyUI's fused `gate_up`,
+# dotted or Kohya-flattened. Qwen-Image's MLP is `img_mlp.net.0.proj`/`img_mlp.net.2`, which none of these match.
+_QWEN_IMAGE21_MLP_MARKERS = (
+    "img_mlp.gate_up.",
+    "img_mlp.gate_layer.",
+    "img_mlp.proj.",
+    "img_mlp.out.",
+    "img_mlp_gate_up",
+    "img_mlp_gate_layer",
+    "img_mlp_proj",
+    "img_mlp_out",
+)
+# A block's own attention projections, dotted or Kohya-flattened. Anchored to the block: LTX-2's
+# `audio_to_video_attn.to_q` is as wide and would match the bare `attn.to_q`.
+_BLOCK_ATTENTION_PROJECTION = re.compile(r"transformer_blocks[._]\d+[._]attn[._]to_(?:[qkv]|out[._]0)[._]")
+_LOKR_FACTOR = re.compile(r"\.(lokr_w[12])(?:_b)?$")
+# Modules of Qwen Image's dual-stream blocks that no other family naming `transformer_blocks.N` has: its per-stream
+# modulation and MLPs, dotted or Kohya-flattened.
+_QWEN_IMAGE_ONLY_MODULE = re.compile(r"transformer_blocks[._]\d+[._](?:img_mod|txt_mod|img_mlp[._]net|txt_mlp)[._]")
+
+
+# The parameters that carry a layer's input width as their second dimension: the input-side matrix of a low-rank
+# (or DoRA) layer, either of LoHA's, and a full diff, which is the whole weight update.
+_INPUT_WIDTH_PARAMS = (".lora_A.weight", ".lora_down.weight", ".hada_w1_b", ".hada_w2_b", ".diff")
+
+
+def _block_attention_in_features(state_dict: dict[str | int, Any]) -> tuple[set[int], set[int]]:
+    """The input widths of the block-attention projections a LoRA targets: those its layers state directly, and
+    those of its LoKR layers.
+
+    A low-rank, LoHA or full layer carries the width on one of its matrices; a LoKR weight is the Kronecker product
+    of two factors, so its input width is the product of theirs (each given whole, or as the second matrix of a
+    pair).
+    """
+    direct: set[int] = set()
+    factored: set[int] = set()
+    lokr: dict[str, dict[str, int]] = {}
+    for key, value in state_dict.items():
+        if not isinstance(key, str) or _BLOCK_ATTENTION_PROJECTION.search(key) is None:
+            continue
+        shape = getattr(value, "shape", ())
+        if len(shape) != 2:
+            continue
+        if key.endswith(_INPUT_WIDTH_PARAMS):
+            direct.add(shape[1])
+        elif factor := _LOKR_FACTOR.search(key):
+            lokr.setdefault(key[: factor.start()], {})[factor.group(1)] = shape[1]
+    factored.update(f["lokr_w1"] * f["lokr_w2"] for f in lokr.values() if len(f) == 2)
+    return direct, factored
+
+
+def _has_qwen_image21_lora_keys(state_dict: dict[str | int, Any]) -> bool:
+    """True if the state dict is a Qwen-Image-2.1 LoRA, whose module names otherwise overlap Qwen-Image's.
+
+    Its gated MLP (`gate_layer`, `proj` and `out` in diffusers/PEFT, ComfyUI's fused `gate_up`, and their Kohya
+    spellings) is Qwen-Image-2.1's alone. An attention-only LoRA -- PEFT's usual `to_q/to_k/to_v` targets, or
+    `to_out.0` -- names nothing Qwen-Image lacks, so its width decides: the projections read 4096 features here
+    and 3072 in Qwen-Image, so a 4096 one is never Qwen-Image's. A low-rank, LoHA or full layer states that width.
+    A LoKR layer's is a product of factor sizes, which can come to 4096 without any layer being that wide, so it
+    counts unless the file names a module only Qwen-Image has.
+
+    It tells the family apart, not whether the layers are whole: a 2.1 LoRA with a broken layer, or with a text
+    encoder's layer beside it, is still not Qwen-Image's; `_is_qwen_image21_lora` refuses it as a 2.1 one.
+    """
+    if any(isinstance(key, str) and any(m in key for m in _QWEN_IMAGE21_MLP_MARKERS) for key in state_dict):
+        return True
+    direct, factored = _block_attention_in_features(state_dict)
+    if _QWEN_IMAGE21_HIDDEN_SIZE in direct:
+        return True
+    return _QWEN_IMAGE21_HIDDEN_SIZE in factored and not any(
+        isinstance(key, str) and _QWEN_IMAGE_ONLY_MODULE.search(key) for key in state_dict
+    )
+
+
+def _has_krea2_lora_keys(state_dict: dict[str | int, Any]) -> bool:
+    """True if the state dict targets Krea-2's distinctive modules.
+
+    Covers both the diffusers naming (``text_fusion`` / ``time_mod_proj``) and the native/ComfyUI naming
+    (``txtfusion``, or the gated attention ``attn.wq`` + ``attn.gate`` unique to Krea-2's single-stream
+    blocks) so native-format LoRAs are recognized as Krea-2 rather than falling through to another base.
+    """
+    str_keys = [k for k in state_dict.keys() if isinstance(k, str)]
+    if any(("text_fusion" in k or "txtfusion" in k or "time_mod_proj" in k) for k in str_keys):
+        return True
+    # Native gated attention identifies a transformer-only Krea-2 LoRA that lacks the text-fusion stage.
+    return any(".attn.wq." in k for k in str_keys) and any(".attn.gate." in k for k in str_keys)
+
+
+# Each LoRA weight half must be accompanied by its partner half. An orphaned half installs successfully
+# but crashes later during LoRA conversion, so we reject it at identification time.
+_LORA_PAIR_PARTNERS = {
+    "lora_A.weight": "lora_B.weight",
+    "lora_B.weight": "lora_A.weight",
+    "lora_down.weight": "lora_up.weight",
+    "lora_up.weight": "lora_down.weight",
+}
+
+
+def _lora_weight_keys_are_all_paired(
+    state_dict: dict[str | int, Any], key_filter: Callable[[str], bool] | None = None
+) -> bool:
+    """True if *every* lora_A/lora_B/lora_down/lora_up weight (optionally restricted to the keys `key_filter`
+    accepts) has its partner half present. Returns True when there are no such weights at all (nothing to
+    invalidate)."""
+    string_keys = {key for key in state_dict if isinstance(key, str)}
+    for key in string_keys:
+        if key_filter is not None and not key_filter(key):
+            continue
+        for suffix, partner_suffix in _LORA_PAIR_PARTNERS.items():
+            if key.endswith(suffix):
+                if f"{key[: -len(suffix)]}{partner_suffix}" not in string_keys:
+                    return False
+                break
+    return True
+
+
+def _has_complete_lora_pair(state_dict: dict[str | int, Any], key_filter: Callable[[str], bool] | None = None) -> bool:
+    """True if at least one complete lora_A/B (or lora_down/up) pair exists, optionally restricted to the
+    keys `key_filter` accepts.
+
+    Note this only requires a *complete* pair to exist; it does not by itself reject dangling halves
+    elsewhere — callers pair it with :func:`_lora_weight_keys_are_all_paired` (over the whole state dict)
+    to also reject orphaned halves anywhere.
+    """
+    string_keys = {key for key in state_dict if isinstance(key, str)}
+    for key in string_keys:
+        if key_filter is not None and not key_filter(key):
+            continue
+        for suffix, partner_suffix in _LORA_PAIR_PARTNERS.items():
+            if key.endswith(suffix) and f"{key[: -len(suffix)]}{partner_suffix}" in string_keys:
+                return True
+    return False
+
+
+# LyCORIS LoKr layers carry Kronecker operands instead of a lora_A/B (or lora_down/up) pair. `LoKRLayer` needs
+# both operands, each exactly once: whole (`lokr_w1` / `lokr_w2`) or factored into a complete `_a`/`_b` pair.
+# A module missing an operand, holding half a factored pair, or spelling one operand both ways installs fine
+# but fails when the layer is built at generation time — the LoKr counterpart of an orphaned lora_A/B half —
+# so completeness is checked per module, like the A/B pairing.
+_LOKR_WEIGHT_SUFFIXES = tuple(f".{key}" for key in LOKR_WEIGHT_KEYS)
+
+
+def _lokr_suffixes_by_module(
+    state_dict: dict[str | int, Any], key_filter: Callable[[str], bool] | None = None
+) -> dict[str, set[str]]:
+    """Group the LoKr weight keys (optionally restricted to the keys `key_filter` accepts) by module path."""
+    suffixes_by_module: dict[str, set[str]] = {}
+    for key in state_dict:
+        if not isinstance(key, str) or not key.endswith(_LOKR_WEIGHT_SUFFIXES):
+            continue
+        if key_filter is not None and not key_filter(key):
+            continue
+        module_path, _, suffix = key.rpartition(".")
+        suffixes_by_module.setdefault(module_path, set()).add(suffix)
+    return suffixes_by_module
+
+
+def _lokr_operand_is_complete(suffixes: set[str], operand: str) -> bool:
+    """True if a LoKr operand (`lokr_w1` or `lokr_w2`) is present exactly once: whole, or as a full `_a`/`_b` pair."""
+    whole = operand in suffixes
+    factored = suffixes & {f"{operand}_a", f"{operand}_b"}
+    return (whole and not factored) or (not whole and len(factored) == 2)
+
+
+def _lokr_module_is_complete(suffixes: set[str]) -> bool:
+    return _lokr_operand_is_complete(suffixes, "lokr_w1") and _lokr_operand_is_complete(suffixes, "lokr_w2")
+
+
+def _has_complete_lokr_layer(state_dict: dict[str | int, Any], key_filter: Callable[[str], bool] | None = None) -> bool:
+    """True if at least one complete LoKr module exists, optionally restricted to the keys `key_filter` accepts.
+
+    Like :func:`_has_complete_lora_pair`, this does not reject incomplete modules elsewhere — callers pair it
+    with :func:`_lokr_layers_are_all_complete`.
+    """
+    return any(
+        _lokr_module_is_complete(suffixes) for suffixes in _lokr_suffixes_by_module(state_dict, key_filter).values()
+    )
+
+
+def _lokr_layers_are_all_complete(state_dict: dict[str | int, Any]) -> bool:
+    """True if *every* LoKr module in the state dict is complete. Returns True when there are none."""
+    return all(_lokr_module_is_complete(suffixes) for suffixes in _lokr_suffixes_by_module(state_dict).values())
+
+
+# Dotted layouts the converter understands for an explicit Krea-2 override (a transformer-only or
+# text-encoder-only LoRA that lacks the auto-detection text_fusion/time_mod_proj keys still installs under
+# an explicit base). The kohya/LyCORIS layout is deliberately absent - see `_key_is_supported_krea2_layout`.
+_KREA2_SUPPORTED_LORA_PREFIXES = (
+    "transformer.transformer_blocks.",
+    "transformer_blocks.",
+    # The converter also supports the `diffusion_model.` transformer layout
+    # (see krea2_lora_conversion_utils.lora_model_from_krea2_state_dict).
+    "diffusion_model.transformer_blocks.",
+    "diffusion_model.blocks.",
+    "diffusion_model.txtfusion.",
+    "diffusion_model.first.",
+    "diffusion_model.tmlp.",
+    "diffusion_model.tproj.",
+    "diffusion_model.txtmlp.",
+    "diffusion_model.last.linear.",
+    "base_model.model.transformer.transformer_blocks.",
+    "text_encoder.",
+    "base_model.model.text_encoder.",
+)
+
+
+def _key_is_supported_krea2_layout(key: str) -> bool:
+    """True if `key` names a module in a layout the Krea-2 converter can map.
+
+    The dotted layouts are matched by prefix. The kohya/LyCORIS layout is not, because its `lora_unet_`
+    spelling is shared: Wan writes `lora_unet_blocks_<idx>_...` and Anima `lora_unet_[llm_adapter_]blocks_
+    <idx>_...`, so per-module prefixes such as `lora_unet_blocks_` still sweep those files into the explicit
+    Krea-2 override, where they install and then silently no-op at generation time. Asking the converter's
+    own un-flattener whether the flattened path reconstructs to a Krea-2 module leaf rejects them, and as a
+    bonus accepts the doubled-separator spelling (`lora_unet__blocks_...`) that the converter tolerates but
+    no prefix spelled out (review 4888833569, notes 2 and 3).
+    """
+    return key.startswith(_KREA2_SUPPORTED_LORA_PREFIXES) or is_kohya_krea2_lora_key(key)
+
+
+class LoRA_LyCORIS_Krea2_Config(LoRA_LyCORIS_Config_Base, Config_Base):
+    """Model config for Krea-2 LoRA models in LyCORIS (single-file diffusers PEFT) format."""
+
+    base: Literal[BaseModelType.Krea2] = Field(default=BaseModelType.Krea2)
+
+    @classmethod
+    def from_model_on_disk(cls, mod: ModelOnDisk, override_fields: dict[str, Any]) -> Self:
+        raise_if_not_file(mod)
+        raise_for_override_fields(cls, override_fields)
+
+        state_dict = mod.load_state_dict()
+        explicit_krea2_override = override_fields.get("base") is BaseModelType.Krea2
+        has_supported_explicit_layer = _has_complete_lora_pair(
+            state_dict, _key_is_supported_krea2_layout
+        ) or _has_complete_lokr_layer(state_dict, _key_is_supported_krea2_layout)
+        # Reject an orphaned half or incomplete LoKr module *anywhere* in the state dict (e.g. a dangling
+        # text_fusion half not under the approved prefixes) — it would install here but fail during LoRA
+        # conversion at generation time.
+        if (
+            explicit_krea2_override
+            and has_supported_explicit_layer
+            and _lora_weight_keys_are_all_paired(state_dict)
+            and _lokr_layers_are_all_complete(state_dict)
+        ):
+            return cls(**override_fields)
+
+        cls._validate_looks_like_lora(mod)
+        cls._validate_base(mod)
+        return cls(**override_fields)
+
+    @classmethod
+    def _validate_looks_like_lora(cls, mod: ModelOnDisk) -> None:
+        """Krea-2 LoRAs have keys like transformer.text_fusion.* / transformer.transformer_blocks.* with
+        a lora_A/lora_B (or lora_down/lora_up) suffix, or LyCORIS LoKr ``lokr_*`` factors. The text-fusion
+        stage is unique to Krea-2."""
+        state_dict = mod.load_state_dict()
+        # Require a *complete* lora_A/B (or lora_down/up) pair or LoKr module, not merely any lora/dora/lokr
+        # suffix: a file with only ``dora_scale`` and no A/B weights would pass a suffix check but fail later on
+        # missing weights.
+        if not (
+            _has_krea2_lora_keys(state_dict)
+            and (_has_complete_lora_pair(state_dict) or _has_complete_lokr_layer(state_dict))
+        ):
+            raise NotAMatchError(
+                "model does not match Krea-2 LoRA heuristics (no complete lora_A/B, lora_down/up or LoKr layer)"
+            )
+        # Reject a file with an orphaned LoRA half (a valid layer plus a dangling lora_A/B/down/up) or an
+        # incomplete LoKr module; it would install here but fail later during LoRA conversion.
+        if not _lora_weight_keys_are_all_paired(state_dict):
+            raise NotAMatchError("Krea-2 LoRA has an incomplete lora_A/B (or lora_down/up) weight pair")
+        if not _lokr_layers_are_all_complete(state_dict):
+            raise NotAMatchError("Krea-2 LoRA has an incomplete LoKr module (lokr_w1 / lokr_w2 operands)")
+
+    @classmethod
+    def _get_base_or_raise(cls, mod: ModelOnDisk) -> BaseModelType:
+        if _has_krea2_lora_keys(mod.load_state_dict()):
+            return BaseModelType.Krea2
+        raise NotAMatchError("model does not look like a Krea-2 LoRA")
+
+
+def _is_qwen_image21_lora(state_dict: dict[str | int, Any]) -> bool:
+    """A Qwen-Image-2.1 LoRA that applies in full: every layer complete, on a module this transformer has, and of
+    that module's weight shape.
+
+    That every key must name a Qwen-Image-2.1 module of its shape also rules out the families whose module names it
+    shares, as long as their LoRA touches one module 2.1 lacks or shapes differently. FLUX.2 Klein 9B is as wide
+    (4096); its text embedders, single blocks and text stream (`add_q_proj`, `ff`) are its own, and its `proj_out`
+    and `norm_out.linear` have 128 and 8192 output rows where 2.1's have 64 and 4096. A Klein LoRA on nothing but its
+    double blocks' image attention has a 2.1 LoRA's names and shapes, and reads as one.
+    """
+    return _has_qwen_image21_lora_keys(state_dict) and not qwen_image_21_unsupported_lora_keys(state_dict)
+
+
+class LoRA_LyCORIS_QwenImage21_Config(LoRA_LyCORIS_Config_Base, Config_Base):
+    """Model config for Qwen-Image-2.1 LoRAs: ComfyUI (`diffusion_model.`, fused `gate_up`), diffusers/PEFT and
+    Kohya layouts, of low-rank, DoRA, LoKR, LoHA or full layers that apply to it in full."""
+
+    base: Literal[BaseModelType.QwenImage21] = Field(default=BaseModelType.QwenImage21)
+
+    @classmethod
+    def _validate_looks_like_lora(cls, mod: ModelOnDisk) -> None:
+        # An incomplete or misplaced layer is refused here, so it cannot install and then fail in conversion.
+        if not _is_qwen_image21_lora(mod.load_state_dict()):
+            raise NotAMatchError("model does not match Qwen-Image-2.1 LoRA heuristics")
+
+    @classmethod
+    def _get_base_or_raise(cls, mod: ModelOnDisk) -> BaseModelType:
+        if _is_qwen_image21_lora(mod.load_state_dict()):
+            return BaseModelType.QwenImage21
+        raise NotAMatchError("model does not look like a Qwen-Image-2.1 LoRA")
+
+
+def _raise_unless_flux3_lora(state_dict: dict[str | int, Any], metadata: dict[str, str]) -> None:
+    """`NotAMatchError` for a file that is no FLUX.3 LoRA; `InvalidMatchError`, naming what does not apply, for one that
+    does not apply in full or whose header asks for a scaling this does not apply (`peft_scale`).
+
+    `InvalidMatchError` because the file is a FLUX.3 LoRA: the installer names the reason instead of registering an
+    unknown model, and a part that does not apply would install and then fail, or apply in part.
+    """
+    if not has_flux3_lora_keys(state_dict):
+        raise NotAMatchError("model does not look like a FLUX.3 LoRA")
+    keys = read_flux3_lora_keys(state_dict)
+    refused = {**keys.refused, **misshapen_flux3_layers(state_dict, keys)}
+    if refused:
+        raise InvalidMatchError(describe_refusal(refused))
+    try:
+        peft_scale(metadata)
+    except ValueError as e:
+        raise InvalidMatchError(str(e)) from None
+
+
+class LoRA_LyCORIS_Flux3_Config(LoRA_LyCORIS_Config_Base, Config_Base):
+    """Model config for FLUX.3 Image LoRA files: diffusers/PEFT, Black Forest Labs' native names (ai-toolkit, ComfyUI)
+    and raw PEFT, of low-rank, DoRA, LoKR, LoHA or full layers that apply to the transformer in full, with no diffusers
+    header or one describing a PEFT LoRA (`peft_scale`). LyCORIS here is the single-file format: LyCORIS's own
+    flattened key names (`lycoris_...`) are none of these layouts and are not recognized.
+
+    No variant: Klein and Klein Base share the transformer, so a LoRA trained on either runs on both.
+    """
+
+    base: Literal[BaseModelType.Flux3] = Field(default=BaseModelType.Flux3)
+
+    @classmethod
+    def _validate_looks_like_lora(cls, mod: ModelOnDisk) -> None:
+        _raise_unless_flux3_lora(mod.load_state_dict(), mod.metadata())
+
+    @classmethod
+    def _get_base_or_raise(cls, mod: ModelOnDisk) -> BaseModelType:
+        if has_flux3_lora_keys(mod.load_state_dict()):
+            return BaseModelType.Flux3
+        raise NotAMatchError("model does not look like a FLUX.3 LoRA")
+
+
+class LoRA_LyCORIS_Anima_Config(LoRA_LyCORIS_Config_Base, Config_Base):
+    """Model config for Anima LoRA models in LyCORIS format."""
+
+    base: Literal[BaseModelType.Anima] = Field(default=BaseModelType.Anima)
+
+    @classmethod
+    def _validate_looks_like_lora(cls, mod: ModelOnDisk) -> None:
+        """Anima LoRAs use Kohya-style keys targeting Cosmos DiT blocks.
+
+        Anima LoRAs have keys like:
+        - lora_unet_blocks_0_cross_attn_k_proj.lora_down.weight (Kohya format)
+        - diffusion_model.blocks.0.cross_attn.k_proj.lora_A.weight (diffusers PEFT format)
+        - transformer.blocks.0.mlp.layer_0.lora_A.weight (Anima-only MLP layer)
+
+        Uses the **strict** Cosmos-DiT detectors, which require an
+        Anima-exclusive subcomponent name (``mlp``, ``adaln_modulation``, or
+        ``_proj``-suffixed attention). The loose detectors would also accept
+        Wan-native LoRAs (which use ``cross_attn``/``self_attn`` too but with
+        bare ``.q``/``.k``/``.v``/``.o`` rather than ``_proj``), so they're not
+        safe for first-match-wins probing — see the regression tests in
+        ``test_wan_lora_probe_independence.py``.
+        """
+        state_dict = mod.load_state_dict()
+        str_keys = [k for k in state_dict.keys() if isinstance(k, str)]
+
+        has_cosmos_keys = has_cosmos_dit_kohya_keys_strict(str_keys) or has_cosmos_dit_peft_keys_strict(str_keys)
+
+        # Also check for LoRA/LoKR weight suffixes
+        has_lora_suffix = state_dict_has_any_keys_ending_with(
+            state_dict,
+            {
+                "lora_A.weight",
+                "lora_B.weight",
+                "lora_down.weight",
+                "lora_up.weight",
+                "dora_scale",
+                ".lokr_w1",
+                ".lokr_w2",
+            },
+        )
+
+        if has_cosmos_keys and has_lora_suffix and not has_ltx2_lora_keys(str_keys):
+            return
+
+        raise NotAMatchError("model does not match Anima LoRA heuristics")
+
+    @classmethod
+    def _get_base_or_raise(cls, mod: ModelOnDisk) -> BaseModelType:
+        """Anima LoRAs target Cosmos DiT blocks (blocks.X.mlp, blocks.X.adaln_modulation,
+        blocks.X.cross_attn.q_proj, etc.).
+
+        Uses the strict Cosmos-DiT detectors to be mutually exclusive with
+        Wan-LoRA detection — see ``_validate_looks_like_lora`` for rationale.
+        """
+        state_dict = mod.load_state_dict()
+        str_keys = [k for k in state_dict.keys() if isinstance(k, str)]
+
+        if (
+            has_cosmos_dit_kohya_keys_strict(str_keys) or has_cosmos_dit_peft_keys_strict(str_keys)
+        ) and not has_ltx2_lora_keys(str_keys):
+            return BaseModelType.Anima
+
+        raise NotAMatchError("model does not look like an Anima LoRA")
+
+
+class LoRA_LyCORIS_Wan_Config(LoRA_LyCORIS_Config_Base, Config_Base):
+    """Model config for Wan 2.2 LoRA models in LyCORIS format.
+
+    Wan LoRAs target ``WanTransformer3DModel`` blocks. The Wan 2.2 A14B family
+    is dual-expert (high-noise + low-noise) — LoRAs are typically trained
+    against one expert. ``expert`` records which one so the model loader
+    invocation can wire it to the correct ``loras`` / ``loras_low_noise`` list.
+    Many LoRAs are expert-agnostic (TI2V-5B family, or community LoRAs that
+    just don't tag the expert) — these get ``expert=None`` and are applied to
+    both experts by default.
+    """
+
+    base: Literal[BaseModelType.Wan] = Field(default=BaseModelType.Wan)
+    expert: Literal["high", "low"] | None = Field(
+        default=None,
+        description="For Wan 2.2 A14B dual-expert LoRAs: 'high' targets the high-noise expert, "
+        "'low' targets the low-noise expert. None means the LoRA is expert-agnostic "
+        "(TI2V-5B, or community LoRAs without explicit tagging) and is applied to both.",
+    )
+    variant: WanLoRAVariantType | None = Field(
+        default=None,
+        description="The Wan model family this LoRA targets, detected from its inner-dim "
+        "(5120 -> A14B, 3072 -> TI2V-5B). A14B LoRAs are incompatible with TI2V-5B mains "
+        "(and vice versa) — they crash with a shape mismatch in the layer patcher. The "
+        "linear-view graph builder filters LoRAs on variant when building the LoRA "
+        "collection. None means the LoRA's inner-dim couldn't be identified.",
+    )
+
+    @classmethod
+    def _validate_looks_like_lora(cls, mod: ModelOnDisk) -> None:
+        """Wan LoRAs target attn1/attn2/ffn.net (diffusers form) or self_attn/cross_attn/ffn.N (native form)."""
+        state_dict = mod.load_state_dict()
+        str_keys = [k for k in state_dict.keys() if isinstance(k, str)]
+
+        has_wan_keys = has_wan_kohya_keys(str_keys) or has_wan_peft_keys(str_keys)
+        has_lora_suffix = state_dict_has_any_keys_ending_with(
+            state_dict,
+            {
+                "lora_A.weight",
+                "lora_B.weight",
+                "lora_down.weight",
+                "lora_up.weight",
+                "dora_scale",
+                ".lokr_w1",
+                ".lokr_w2",
+            },
+        )
+
+        # Reject if any non-Wan architecture signature is present. Without this
+        # guard a Wan LoRA could be falsely identified by Anima (cross_attn /
+        # self_attn name collision) or vice versa.
+        if has_wan_keys and has_lora_suffix and not has_non_wan_architecture_keys(str_keys):
+            return
+
+        raise NotAMatchError("model does not match Wan LoRA heuristics")
+
+    @classmethod
+    def _get_base_or_raise(cls, mod: ModelOnDisk) -> BaseModelType:
+        state_dict = mod.load_state_dict()
+        str_keys = [k for k in state_dict.keys() if isinstance(k, str)]
+
+        if (has_wan_kohya_keys(str_keys) or has_wan_peft_keys(str_keys)) and not has_non_wan_architecture_keys(
+            str_keys
+        ):
+            return BaseModelType.Wan
+
+        raise NotAMatchError("model does not look like a Wan LoRA")
+
+    @classmethod
+    def from_model_on_disk(cls, mod: ModelOnDisk, override_fields: dict[str, Any]) -> Self:
+        # Run the base-class probe (file-check, lora-suffix, base detection).
+        instance = super().from_model_on_disk(mod, override_fields)
+
+        # Auto-detect the model-family variant from inner_dim in the state
+        # dict. The override field skips this if the user has set it.
+        #
+        # Resolved *before* the expert tag because the expert is only meaningful for
+        # A14B — see below.
+        if instance.variant is None:
+            instance.variant = detect_wan_lora_variant(mod.load_state_dict())
+
+        # Auto-detect the expert tag from the filename if the user didn't override
+        # it, using the same helper as the transformer probes so the two can't drift
+        # apart. That also picks up the bare ``HIGH``/``LOW`` convention, which
+        # matters here: an expert-specific LoRA left untagged is applied to *both*
+        # experts by the Wan LoRA loader, which is wrong for the high/low pairs the
+        # Lightning-style distills ship in.
+        #
+        # TI2V-5B is single-transformer, so it has no experts and the denoise path
+        # reads only the primary LoRA list. Tagging a 5B LoRA would route it through
+        # ``_resolve_target("auto", ...)`` into ``loras_low_noise`` alone, where it is
+        # silently inert. The bare-token convention makes that reachable on ordinary
+        # names — ``Wan2.2_TI2V_5B_low_light_v2`` has ``low`` as a standalone token —
+        # so pin the field the same way ``_resolve_wan_expert`` pins the main-model
+        # probe. Only A14B (or an inconclusive variant) gets a tag.
+        #
+        # Note 'none' vs None: this config uses None for "untagged, apply to both",
+        # so a 'none' result must leave the field alone.
+        if instance.expert is None and instance.variant != WanLoRAVariantType.Wan5B:
+            detected = _detect_wan_expert(mod.path.stem)
+            if detected != "none":
+                instance.expert = detected
+
+        return instance
+
+
+class LoRA_LyCORIS_MiniMaxH3_Config(LoRA_LyCORIS_Config_Base, Config_Base):
+    """Model config for MiniMax H3 LoRA models in LyCORIS (single-file PEFT or kohya) format.
+
+    H3 LoRAs (e.g. the MiniMax-H3 Turbo step-distillation LoRA) target the
+    ``MiniMaxH3Transformer3DModel`` in the checkpoint's native single-file layout,
+    with dotted keys or kohya-flattened ``lora_unet_*`` keys.
+    Detection keys on H3-exclusive submodule names (the fused ``attn.qkv_proj``
+    under a bare ``attn.``, and ``adaln_proj.linear``) and rejects any state dict
+    carrying another architecture's signature — see
+    ``minimax_h3_lora_constants`` for the exact patterns and why ``mlp.fc1``
+    alone would not be safe.
+    """
+
+    base: Literal[BaseModelType.MiniMaxH3] = Field(default=BaseModelType.MiniMaxH3)
+
+    @classmethod
+    def _validate_looks_like_lora(cls, mod: ModelOnDisk) -> None:
+        state_dict = mod.load_state_dict()
+        str_keys = [k for k in state_dict.keys() if isinstance(k, str)]
+
+        if not has_minimax_h3_lora_keys(str_keys) or has_non_minimax_h3_architecture_keys(str_keys):
+            raise NotAMatchError("model does not match MiniMax H3 LoRA heuristics")
+        # LyCORIS variants (LoKR/LoHA/DoRA) cannot be applied across H3's fused qkv/SwiGLU
+        # tensors; admitting them here would only defer the failure to generation time (or,
+        # for DoRA's per-output-row magnitudes, silently mis-apply them). Reject at install.
+        if has_unsupported_minimax_h3_lora_variant_keys(str_keys):
+            raise NotAMatchError(
+                "MiniMax H3 LoRAs must be plain low-rank (lora_A/lora_B); LoKR/LoHA/DoRA variants "
+                "are not supported on H3's fused transformer layers"
+            )
+        # The converter's own rule: every layer one complete low-rank pair, no stray tensors. This
+        # also rejects files without LoRA suffixes (e.g. base-model weights).
+        defect = find_minimax_h3_lora_defect(str_keys)
+        if defect is not None:
+            raise NotAMatchError(f"malformed MiniMax H3 LoRA: {defect}")
+
+    @classmethod
+    def _get_base_or_raise(cls, mod: ModelOnDisk) -> BaseModelType:
+        state_dict = mod.load_state_dict()
+        str_keys = [k for k in state_dict.keys() if isinstance(k, str)]
+
+        if (
+            has_minimax_h3_lora_keys(str_keys)
+            and not has_non_minimax_h3_architecture_keys(str_keys)
+            and not has_unsupported_minimax_h3_lora_variant_keys(str_keys)
+            and find_minimax_h3_lora_defect(str_keys) is None
+        ):
+            return BaseModelType.MiniMaxH3
+
+        raise NotAMatchError("model does not look like a MiniMax H3 LoRA")
+
+
+class LoRA_LyCORIS_LTX2_Config(LoRA_LyCORIS_Config_Base, Config_Base):
+    """Model config for LTX-2 LoRA models in LyCORIS (single-file PEFT) format.
+
+    LTX-2 LoRAs (e.g. the 2.5 distilled step-accelerator) target the
+    ``LTX2VideoTransformer3DModel`` in the official Lightricks single-file layout. Detection keys
+    on submodules that exist only because LTX-2 is a *dual-stream* video+audio transformer -- the
+    per-block audio tower and the cross-modal attentions, or the top-level cross-modal modulation
+    heads -- and rejects any state dict carrying another architecture's signature. See
+    ``ltx2_lora_constants`` for the exact patterns, and for why the block path alone is not
+    sufficient: LTX-2 shares ``transformer_blocks.N.attn1`` with Wan's diffusers layout and with
+    QwenImage.
+    """
+
+    base: Literal[BaseModelType.LTX2] = Field(default=BaseModelType.LTX2)
+
+    @classmethod
+    def _validate_looks_like_lora(cls, mod: ModelOnDisk) -> None:
+        state_dict = mod.load_state_dict()
+        str_keys = [k for k in state_dict.keys() if isinstance(k, str)]
+
+        has_keys = has_ltx2_lora_keys(str_keys)
+        # The conversion emits ordinary low-rank pairs; a LoKR/LoHA factorization or DoRA's
+        # per-row magnitudes are a different patch shape. Admitting them here would only defer
+        # the failure to generation time. Reject at install.
+        if has_keys and has_unsupported_ltx2_lora_variant_keys(str_keys):
+            raise NotAMatchError(
+                "LTX-2 LoRAs must be plain low-rank (lora_A/lora_B); LoKR/LoHA/DoRA variants are not supported"
+            )
+        has_lora_suffix = state_dict_has_any_keys_ending_with(
+            state_dict,
+            {
+                "lora_A.weight",
+                "lora_B.weight",
+                "lora_down.weight",
+                "lora_up.weight",
+            },
+        )
+
+        if has_keys and has_lora_suffix and not has_non_ltx2_architecture_keys(str_keys):
+            return
+
+        raise NotAMatchError("model does not match LTX-2 LoRA heuristics")
+
+    @classmethod
+    def _get_base_or_raise(cls, mod: ModelOnDisk) -> BaseModelType:
+        state_dict = mod.load_state_dict()
+        str_keys = [k for k in state_dict.keys() if isinstance(k, str)]
+
+        if (
+            has_ltx2_lora_keys(str_keys)
+            and not has_non_ltx2_architecture_keys(str_keys)
+            and not has_unsupported_ltx2_lora_variant_keys(str_keys)
+        ):
+            return BaseModelType.LTX2
+
+        raise NotAMatchError("model does not look like an LTX-2 LoRA")
+
+
+class ControlAdapter_Config_Base(ABC, BaseModel):
+    default_settings: ControlAdapterDefaultSettings | None = Field(None)
+
+
+class ControlLoRA_LyCORIS_FLUX_Config(ControlAdapter_Config_Base, Config_Base):
+    """Model config for Control LoRA models."""
+
+    base: Literal[BaseModelType.Flux] = Field(default=BaseModelType.Flux)
+    type: Literal[ModelType.ControlLoRa] = Field(default=ModelType.ControlLoRa)
+    format: Literal[ModelFormat.LyCORIS] = Field(default=ModelFormat.LyCORIS)
+
+    trigger_phrases: set[str] | None = Field(None)
+
+    @classmethod
+    def from_model_on_disk(cls, mod: ModelOnDisk, override_fields: dict[str, Any]) -> Self:
+        raise_if_not_file(mod)
+
+        raise_for_override_fields(cls, override_fields)
+
+        cls._validate_looks_like_control_lora(mod)
+
+        return cls(**override_fields)
+
+    @classmethod
+    def _validate_looks_like_control_lora(cls, mod: ModelOnDisk) -> None:
+        state_dict = mod.load_state_dict()
+
+        if not is_state_dict_likely_flux_control(state_dict):
+            raise NotAMatchError("model state dict does not look like a Flux Control LoRA")
+
+
+class LoRA_Diffusers_Config_Base(LoRA_Config_Base):
+    """Model config for LoRA/Diffusers models."""
+
+    # TODO(psyche): Needs base handling. For FLUX, the Diffusers format does not indicate a folder model; it indicates
+    # the weights format. FLUX Diffusers LoRAs are single files.
+
+    format: Literal[ModelFormat.Diffusers] = Field(default=ModelFormat.Diffusers)
+
+    @classmethod
+    def from_model_on_disk(cls, mod: ModelOnDisk, override_fields: dict[str, Any]) -> Self:
+        raise_if_not_dir(mod)
+
+        raise_for_override_fields(cls, override_fields)
+
+        cls._validate_base(mod)
+
+        return cls(**override_fields)
+
+    @classmethod
+    def _validate_base(cls, mod: ModelOnDisk) -> None:
+        """Raise `NotAMatch` if the model base does not match this config class."""
+        expected_base = cls.model_fields["base"].default
+        recognized_base = cls._get_base_or_raise(mod)
+        if expected_base is not recognized_base:
+            raise NotAMatchError(f"base is {recognized_base}, not {expected_base}")
+
+    @classmethod
+    def _get_base_or_raise(cls, mod: ModelOnDisk) -> BaseModelType:
+        if _get_flux_lora_format(mod):
+            if _is_flux2_lora(mod):
+                return BaseModelType.Flux2
+            return BaseModelType.Flux
+
+        # If we've gotten here, we assume that the LoRA is a Stable Diffusion LoRA
+        path_to_weight_file = cls._get_weight_file_or_raise(mod)
+        state_dict = mod.load_state_dict(path_to_weight_file)
+        token_vector_length = lora_token_vector_length(state_dict)
+
+        match token_vector_length:
+            case 768:
+                return BaseModelType.StableDiffusion1
+            case 1024:
+                return BaseModelType.StableDiffusion2
+            case 1280:
+                return BaseModelType.StableDiffusionXL  # recognizes format at https://civitai.com/models/224641
+            case 2048:
+                return BaseModelType.StableDiffusionXL
+            case _:
+                # Some SDXL LoRAs (e.g. self-attention-only "slider" LoRAs) target only the
+                # UNet and lack the cross-attention / text-encoder keys that
+                # lora_token_vector_length() needs. Fall back to detecting SDXL from the
+                # UNet's deep transformer-block structure.
+                if _state_dict_looks_like_sdxl_unet_lora(state_dict):
+                    return BaseModelType.StableDiffusionXL
+                raise NotAMatchError(f"unrecognized token vector length {token_vector_length}")
+
+    @classmethod
+    def _get_weight_file_or_raise(cls, mod: ModelOnDisk) -> Path:
+        suffixes = ["bin", "safetensors"]
+        weight_files = [mod.path / f"pytorch_lora_weights.{sfx}" for sfx in suffixes]
+        for wf in weight_files:
+            if wf.exists():
+                return wf
+        raise NotAMatchError("missing pytorch_lora_weights.bin or pytorch_lora_weights.safetensors")
+
+
+class LoRA_Diffusers_SD1_Config(LoRA_Diffusers_Config_Base, Config_Base):
+    base: Literal[BaseModelType.StableDiffusion1] = Field(default=BaseModelType.StableDiffusion1)
+
+
+class LoRA_Diffusers_SD2_Config(LoRA_Diffusers_Config_Base, Config_Base):
+    base: Literal[BaseModelType.StableDiffusion2] = Field(default=BaseModelType.StableDiffusion2)
+
+
+class LoRA_Diffusers_SDXL_Config(LoRA_Diffusers_Config_Base, Config_Base):
+    base: Literal[BaseModelType.StableDiffusionXL] = Field(default=BaseModelType.StableDiffusionXL)
+
+
+class LoRA_Diffusers_FLUX_Config(LoRA_Diffusers_Config_Base, Config_Base):
+    base: Literal[BaseModelType.Flux] = Field(default=BaseModelType.Flux)
+
+
+class LoRA_Diffusers_Flux2_Config(LoRA_Diffusers_Config_Base, Config_Base):
+    """Model config for FLUX.2 (Klein) LoRA models in Diffusers format."""
+
+    base: Literal[BaseModelType.Flux2] = Field(default=BaseModelType.Flux2)
+    variant: Flux2VariantType | None = Field(default=None)
+
+    @classmethod
+    def from_model_on_disk(cls, mod: ModelOnDisk, override_fields: dict[str, Any]) -> Self:
+        raise_if_not_dir(mod)
+        raise_for_override_fields(cls, override_fields)
+        cls._validate_base(mod)
+        path_to_weight_file = cls._get_weight_file_or_raise(mod)
+        state_dict = mod.load_state_dict(path_to_weight_file)
+        override_fields.setdefault("variant", _get_flux2_lora_variant(state_dict))
+        return cls(**override_fields)
+
+    @classmethod
+    def _get_base_or_raise(cls, mod: ModelOnDisk) -> BaseModelType:
+        path_to_weight_file = cls._get_weight_file_or_raise(mod)
+        state_dict = mod.load_state_dict(path_to_weight_file)
+        if _is_flux2_lora_state_dict(state_dict):
+            return BaseModelType.Flux2
+        raise NotAMatchError("model is not a FLUX.2 Diffusers LoRA")
+
+
+class LoRA_Diffusers_Flux3_Config(LoRA_Diffusers_Config_Base, Config_Base):
+    """Model config for a FLUX.3 Image LoRA saved as a diffusers folder (`pytorch_lora_weights.safetensors`), as a
+    repository-id install of a diffusers trainer's output leaves it. The file is held to what
+    `LoRA_LyCORIS_Flux3_Config` holds a single file to."""
+
+    base: Literal[BaseModelType.Flux3] = Field(default=BaseModelType.Flux3)
+
+    @classmethod
+    def from_model_on_disk(cls, mod: ModelOnDisk, override_fields: dict[str, Any]) -> Self:
+        raise_if_not_dir(mod)
+        raise_for_override_fields(cls, override_fields)
+        path_to_weight_file = cls._get_weight_file_or_raise(mod)
+        _raise_unless_flux3_lora(mod.load_state_dict(path_to_weight_file), mod.metadata(path_to_weight_file))
+        return cls(**override_fields)
+
+
+class LoRA_Diffusers_ZImage_Config(LoRA_Diffusers_Config_Base, Config_Base):
+    """Model config for Z-Image LoRA models in Diffusers format."""
+
+    base: Literal[BaseModelType.ZImage] = Field(default=BaseModelType.ZImage)
+    variant: ZImageVariantType | None = Field(default=None)

@@ -1,0 +1,236 @@
+import { Text } from "@/components/atoms/Text/Text";
+import { type ReactNode, useState } from "react";
+import {
+  OutputRenderer,
+  OutputMetadata,
+  DownloadContent,
+  CopyContent,
+} from "../types";
+import { parseWorkspaceURI, isWorkspaceURI } from "@/lib/workspace-uri";
+import { Skeleton } from "@/components/atoms/Skeleton/Skeleton";
+import { Download04Icon, File02Icon } from "@hugeicons/core-free-icons";
+import { Icon } from "@/components/atoms/Icon/Icon";
+
+const imageMimeTypes = [
+  "image/jpeg",
+  "image/png",
+  "image/gif",
+  "image/bmp",
+  "image/svg+xml",
+  "image/webp",
+  "image/x-icon",
+];
+
+const videoMimeTypes = [
+  "video/mp4",
+  "video/webm",
+  "video/ogg",
+  "video/quicktime",
+  "video/x-msvideo",
+  "video/x-matroska",
+];
+
+const audioMimeTypes = [
+  "audio/mpeg",
+  "audio/ogg",
+  "audio/wav",
+  "audio/webm",
+  "audio/aac",
+  "audio/flac",
+];
+
+function buildDownloadURL(fileID: string, shareToken?: string): string {
+  if (shareToken) {
+    return `/api/proxy/api/public/shared/${shareToken}/files/${fileID}/download`;
+  }
+  return `/api/proxy/api/workspace/files/${fileID}/download`;
+}
+
+function canRenderWorkspaceFile(value: unknown): boolean {
+  return isWorkspaceURI(value);
+}
+
+function getFileTypeLabel(mimeType: string | null): string {
+  if (!mimeType) return "File";
+  const sub = mimeType.split("/")[1];
+  if (!sub) return "File";
+  return `${sub.toUpperCase()} file`;
+}
+
+function WorkspaceImage({ src, alt }: { src: string; alt: string }) {
+  const [loaded, setLoaded] = useState(false);
+
+  return (
+    <div className="group relative">
+      {!loaded && (
+        <Skeleton className="absolute inset-0 h-full min-h-40 w-full rounded-md" />
+      )}
+      {/* eslint-disable-next-line @next/next/no-img-element -- remote URL from any host, which next/image would need configured */}
+      <img
+        src={src}
+        alt={alt}
+        className={`h-auto max-w-full rounded-md border border-border-base ${loaded ? "opacity-100" : "min-h-40 opacity-0"}`}
+        loading="lazy"
+        onLoad={() => setLoaded(true)}
+        onError={() => setLoaded(true)}
+      />
+    </div>
+  );
+}
+
+function WorkspaceVideo({ src, mimeType }: { src: string; mimeType: string }) {
+  const [loaded, setLoaded] = useState(false);
+
+  return (
+    <div className="group relative">
+      {!loaded && (
+        <Skeleton className="absolute inset-0 h-full min-h-40 w-full rounded-md" />
+      )}
+      <video
+        controls
+        className={`h-auto max-w-full rounded-md border border-border-base ${loaded ? "opacity-100" : "min-h-40 opacity-0"}`}
+        preload="metadata"
+        onLoadedMetadata={() => setLoaded(true)}
+        onError={() => setLoaded(true)}
+      >
+        <source src={src} type={mimeType} />
+        Your browser does not support the video tag.
+      </video>
+    </div>
+  );
+}
+
+function WorkspaceAudio({ src, mimeType }: { src: string; mimeType: string }) {
+  const [loaded, setLoaded] = useState(false);
+
+  return (
+    <div className="group relative">
+      {!loaded && (
+        <Skeleton className="absolute inset-0 h-full min-h-12 w-full rounded-md" />
+      )}
+      <audio
+        controls
+        preload="metadata"
+        className={`w-full ${loaded ? "opacity-100" : "min-h-12 opacity-0"}`}
+        onLoadedMetadata={() => setLoaded(true)}
+        onError={() => setLoaded(true)}
+      >
+        <source src={src} type={mimeType} />
+        Your browser does not support the audio tag.
+      </audio>
+    </div>
+  );
+}
+
+function renderWorkspaceFile(
+  value: unknown,
+  metadata?: OutputMetadata,
+): ReactNode {
+  const uri = parseWorkspaceURI(String(value));
+  if (!uri) return null;
+
+  const downloadURL = buildDownloadURL(uri.fileID, metadata?.shareToken);
+  const mimeType = uri.mimeType || metadata?.mimeType || null;
+
+  if (mimeType && imageMimeTypes.includes(mimeType)) {
+    return (
+      <WorkspaceImage src={downloadURL} alt={metadata?.filename || "Image"} />
+    );
+  }
+
+  if (mimeType && videoMimeTypes.includes(mimeType)) {
+    return <WorkspaceVideo src={downloadURL} mimeType={mimeType} />;
+  }
+
+  if (mimeType && audioMimeTypes.includes(mimeType)) {
+    return <WorkspaceAudio src={downloadURL} mimeType={mimeType} />;
+  }
+
+  // Generic file card with icon and download link
+  const label = getFileTypeLabel(mimeType);
+  return (
+    <div className="flex items-center gap-3 rounded-lg border border-border-base bg-surface-muted p-3">
+      <Icon
+        icon={File02Icon}
+        size={28}
+        tone="muted"
+        className="flex-shrink-0"
+      />
+      <div className="flex min-w-0 flex-1 flex-col">
+        <span className="truncate text-body font-medium text-foreground-base">
+          {metadata?.filename || label}
+        </span>
+        {mimeType && (
+          <Text variant="small-tight" as="span" tone="muted">
+            {mimeType}
+          </Text>
+        )}
+      </div>
+      <a
+        href={downloadURL}
+        download
+        className="flex-shrink-0 rounded-md p-1.5 text-foreground-tertiary transition-colors hover:bg-surface-active hover:text-foreground-body"
+      >
+        <Icon icon={Download04Icon} size={18} />
+      </a>
+    </div>
+  );
+}
+
+function getCopyContentWorkspaceFile(
+  value: unknown,
+  metadata?: OutputMetadata,
+): CopyContent | null {
+  const uri = parseWorkspaceURI(String(value));
+  if (!uri) return null;
+
+  const downloadURL = buildDownloadURL(uri.fileID, metadata?.shareToken);
+  const mimeType =
+    uri.mimeType || metadata?.mimeType || "application/octet-stream";
+
+  return {
+    mimeType,
+    data: async () => {
+      const response = await fetch(downloadURL);
+      if (!response.ok) {
+        throw new Error(`Failed to fetch file: ${response.status}`);
+      }
+      return await response.blob();
+    },
+    alternativeMimeTypes: ["text/plain"],
+    fallbackText: String(value),
+  };
+}
+
+function getDownloadContentWorkspaceFile(
+  value: unknown,
+  metadata?: OutputMetadata,
+): DownloadContent | null {
+  const uri = parseWorkspaceURI(String(value));
+  if (!uri) return null;
+
+  const mimeType =
+    uri.mimeType || metadata?.mimeType || "application/octet-stream";
+  const ext = mimeType.split("/")[1] || "bin";
+  const filename = metadata?.filename || `file.${ext}`;
+
+  return {
+    data: buildDownloadURL(uri.fileID, metadata?.shareToken),
+    filename,
+    mimeType,
+  };
+}
+
+function isConcatenableWorkspaceFile(): boolean {
+  return false;
+}
+
+export const workspaceFileRenderer: OutputRenderer = {
+  name: "WorkspaceFileRenderer",
+  priority: 50, // Higher than video (45) and image (40) so it matches first
+  canRender: canRenderWorkspaceFile,
+  render: renderWorkspaceFile,
+  getCopyContent: getCopyContentWorkspaceFile,
+  getDownloadContent: getDownloadContentWorkspaceFile,
+  isConcatenable: isConcatenableWorkspaceFile,
+};

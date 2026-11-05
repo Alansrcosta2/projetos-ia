@@ -1,0 +1,301 @@
+"use client";
+
+import type { GraphExecutionJobInfo } from "@/app/api/__generated__/models/graphExecutionJobInfo";
+import { LibraryAgent } from "@/app/api/__generated__/models/libraryAgent";
+import { Skeleton } from "@/components/atoms/Skeleton/Skeleton";
+import { Text } from "@/components/atoms/Text/Text";
+import { ErrorCard } from "@/components/molecules/ErrorCard/ErrorCard";
+import { InfiniteList } from "@/components/molecules/InfiniteList/InfiniteList";
+import {
+  TabsLine,
+  TabsLineContent,
+  TabsLineList,
+  TabsLineTrigger,
+} from "@/components/molecules/TabsLine/TabsLine";
+import { useStableCallback } from "@/hooks/useStableCallback";
+import { activeItemParamFor } from "../../../helpers";
+import { ScheduleListItem } from "./components/ScheduleListItem";
+import { TaskListRow } from "./components/TaskListRow";
+import { TemplateListItem } from "./components/TemplateListItem";
+import { TriggerAgentListItem } from "./components/TriggerAgentListItem";
+import { TriggerListItem } from "./components/TriggerListItem";
+import { uniqueRunsByID } from "./helpers";
+import { useSidebarRunsList } from "./useSidebarRunsList";
+
+interface Props {
+  agent: LibraryAgent;
+  selectedRunId?: string;
+  onSelectRun: (
+    id: string,
+    tab?: "runs" | "scheduled" | "templates" | "triggers",
+  ) => void;
+  onClearSelectedRun?: () => void;
+  onScheduleDeleted?: (deletedScheduleId: string) => void;
+  onTabChange?: (tab: "runs" | "scheduled" | "templates" | "triggers") => void;
+  onCountsChange?: (info: {
+    runsCount: number;
+    schedulesCount: number;
+    templatesCount: number;
+    triggersCount: number;
+    loading?: boolean;
+    hasError?: boolean;
+  }) => void;
+}
+
+export function SidebarRunsList({
+  agent,
+  selectedRunId,
+  onSelectRun,
+  onClearSelectedRun,
+  onScheduleDeleted,
+  onTabChange,
+  onCountsChange,
+}: Props) {
+  // Stable, so the memoised run rows and the auto-select effects in
+  // useSidebarRunsList do not re-run on every parent render.
+  const selectRun = useStableCallback(onSelectRun);
+  const {
+    runs,
+    schedules,
+    templates,
+    triggers,
+    triggerAgents,
+    runsCount,
+    schedulesCount,
+    templatesCount,
+    triggersCount,
+    error,
+    loading,
+    retryFailedQueries,
+    fetchMoreRuns,
+    hasMoreRuns,
+    isFetchingMoreRuns,
+    tabValue,
+  } = useSidebarRunsList({
+    agent,
+    onSelectRun: selectRun,
+    onCountsChange,
+  });
+
+  if (error) {
+    return <ErrorCard responseError={error} onRetry={retryFailedQueries} />;
+  }
+
+  if (loading) {
+    return (
+      <div className="mt-8 ml-6 w-[20vw] space-y-4 px-4">
+        <Skeleton className="h-12 w-full" />
+        <Skeleton className="h-32 w-full" />
+        <Skeleton className="h-24 w-full" />
+      </div>
+    );
+  }
+
+  return (
+    <TabsLine
+      value={tabValue}
+      onValueChange={(v) => {
+        const value = v as "runs" | "scheduled" | "templates" | "triggers";
+        onTabChange?.(value);
+        if (value === "runs") {
+          if (runs && runs.length) {
+            onSelectRun(runs[0].id, "runs");
+          } else {
+            onClearSelectedRun?.();
+          }
+        } else if (value === "scheduled") {
+          if (schedules && schedules.length) {
+            onSelectRun(schedules[0].id, "scheduled");
+          } else {
+            onClearSelectedRun?.();
+          }
+        } else if (value === "templates") {
+          onClearSelectedRun?.();
+        } else if (value === "triggers") {
+          onClearSelectedRun?.();
+        }
+      }}
+      className="flex min-h-0 flex-1 flex-col overflow-hidden"
+    >
+      <div className="relative overflow-hidden">
+        <div className="pointer-events-none absolute top-0 right-0 z-10 h-[46px] w-12 bg-gradient-to-l from-canvas to-transparent" />
+        <div className="overflow-x-auto">
+          <TabsLineList
+            // oxlint-disable-next-line design-system/no-restyle -- the tab underline (border-b) spans this padding; a margin would shorten it
+            className="min-w-max px-4"
+          >
+            <TabsLineTrigger value="runs">
+              Tasks <span className="ml-3 inline-block">{runsCount}</span>
+            </TabsLineTrigger>
+            <TabsLineTrigger value="scheduled">
+              Scheduled{" "}
+              <span className="ml-3 inline-block">{schedulesCount}</span>
+            </TabsLineTrigger>
+            {triggersCount > 0 && (
+              <TabsLineTrigger value="triggers">
+                Triggers{" "}
+                <span className="ml-3 inline-block">{triggersCount}</span>
+              </TabsLineTrigger>
+            )}
+            <TabsLineTrigger value="templates">
+              Templates{" "}
+              <span className="ml-3 inline-block">{templatesCount}</span>
+            </TabsLineTrigger>
+          </TabsLineList>
+        </div>
+      </div>
+
+      <>
+        <TabsLineContent
+          value="runs"
+          className="mx-4 flex min-h-0 flex-1 flex-col"
+        >
+          <InfiniteList
+            items={uniqueRunsByID(runs)}
+            hasMore={!!hasMoreRuns}
+            isFetchingMore={isFetchingMoreRuns}
+            onEndReached={fetchMoreRuns}
+            // oxlint-disable-next-line design-system/no-restyle -- InfiniteList renders a bare div whose children are the list items, so the list layout and scrollbar can only be set here
+            className="scrollbar-thin flex min-h-0 flex-1 scrollbar-thumb-border-strong scrollbar-track-transparent flex-nowrap items-center justify-start gap-4 overflow-x-scroll px-1 pt-1 pb-4 lg:flex-col lg:gap-3 lg:overflow-x-hidden lg:overflow-y-auto"
+            itemWrapperClassName="w-auto lg:w-full"
+            getKey={(run) => run.id}
+            renderItem={(run) => (
+              <TaskListRow
+                run={run}
+                agent={agent}
+                selected={selectedRunId === run.id}
+                onSelectRun={selectRun}
+              />
+            )}
+          />
+        </TabsLineContent>
+        <TabsLineContent
+          value="scheduled"
+          className="mx-4 mt-0 flex min-h-0 flex-1 flex-col"
+        >
+          <div className="scrollbar-thin flex min-h-0 flex-1 scrollbar-thumb-border-strong scrollbar-track-transparent flex-nowrap items-center justify-start gap-4 overflow-x-scroll px-1 pt-1 pb-4 lg:flex-col lg:gap-3 lg:overflow-x-hidden lg:overflow-y-auto">
+            {schedules.length > 0 ? (
+              schedules.map((s: GraphExecutionJobInfo) => (
+                <div className="w-[15rem] lg:w-full" key={s.id}>
+                  <ScheduleListItem
+                    schedule={s}
+                    agent={agent}
+                    selected={selectedRunId === s.id}
+                    onClick={() => onSelectRun(s.id, "scheduled")}
+                    onDeleted={() => onScheduleDeleted?.(s.id)}
+                    onRunCreated={(runID) => onSelectRun(runID, "runs")}
+                  />
+                </div>
+              ))
+            ) : (
+              <div className="flex min-h-[50vh] flex-col items-center justify-center">
+                <Text variant="large" tone="body">
+                  No scheduled workflows
+                </Text>
+              </div>
+            )}
+          </div>
+        </TabsLineContent>
+        {triggersCount > 0 && (
+          <TabsLineContent
+            value="triggers"
+            className="mx-4 mt-0 flex min-h-0 flex-1 flex-col"
+          >
+            <div className="scrollbar-thin flex min-h-0 flex-1 scrollbar-thumb-border-strong scrollbar-track-transparent flex-col gap-4 overflow-x-scroll px-1 pt-1 pb-4 lg:gap-3 lg:overflow-x-hidden lg:overflow-y-auto">
+              {triggers.length > 0 && (
+                <div className="flex flex-col gap-2">
+                  <Text variant="body-medium" tone="muted" className="mx-1">
+                    Webhook Triggers
+                  </Text>
+                  <div className="flex flex-nowrap items-center justify-start gap-4 lg:flex-col lg:gap-3">
+                    {triggers.map((trigger) => (
+                      <div className="w-[15rem] lg:w-full" key={trigger.id}>
+                        <TriggerListItem
+                          trigger={trigger}
+                          agent={agent}
+                          selected={selectedRunId === trigger.id}
+                          onClick={() =>
+                            onSelectRun(
+                              activeItemParamFor("webhook-trigger", trigger.id),
+                              "triggers",
+                            )
+                          }
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {triggerAgents.length > 0 && (
+                <div className="flex flex-col gap-2">
+                  <Text variant="body-medium" tone="muted" className="mx-1">
+                    Trigger Workflows
+                  </Text>
+                  <div className="flex flex-nowrap items-center justify-start gap-4 lg:flex-col lg:gap-3">
+                    {triggerAgents.map((triggerAgent) => (
+                      <div
+                        className="w-[15rem] lg:w-full"
+                        key={triggerAgent.id}
+                      >
+                        <TriggerAgentListItem
+                          triggerAgent={triggerAgent}
+                          parentAgent={agent}
+                          selected={selectedRunId === triggerAgent.id}
+                          onClick={() =>
+                            onSelectRun(
+                              activeItemParamFor(
+                                "trigger-agent",
+                                triggerAgent.id,
+                              ),
+                              "triggers",
+                            )
+                          }
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {triggers.length === 0 && triggerAgents.length === 0 && (
+                <div className="flex min-h-[50vh] flex-col items-center justify-center gap-2 px-6 text-center">
+                  <Text variant="large" tone="body">
+                    No triggers set up
+                  </Text>
+                  <Text variant="body" tone="muted">
+                    Ask an expert to set up a trigger for this workflow (e.g.
+                    &ldquo;run this when a new email arrives&rdquo;).
+                  </Text>
+                </div>
+              )}
+            </div>
+          </TabsLineContent>
+        )}
+        <TabsLineContent
+          value="templates"
+          className="mx-4 mt-0 flex min-h-0 flex-1 flex-col"
+        >
+          <div className="scrollbar-thin flex min-h-0 flex-1 scrollbar-thumb-border-strong scrollbar-track-transparent flex-nowrap items-center justify-start gap-4 overflow-x-scroll px-1 pt-1 pb-4 lg:flex-col lg:gap-3 lg:overflow-x-hidden lg:overflow-y-auto">
+            {templates.length > 0 ? (
+              templates.map((template) => (
+                <div className="w-[15rem] lg:w-full" key={template.id}>
+                  <TemplateListItem
+                    template={template}
+                    agent={agent}
+                    selected={selectedRunId === template.id}
+                    onClick={() => onSelectRun(template.id, "templates")}
+                  />
+                </div>
+              ))
+            ) : (
+              <div className="flex min-h-[50vh] flex-col items-center justify-center">
+                <Text variant="large" tone="body">
+                  No templates saved
+                </Text>
+              </div>
+            )}
+          </div>
+        </TabsLineContent>
+      </>
+    </TabsLine>
+  );
+}

@@ -1,0 +1,356 @@
+"use client";
+
+import React, { useState } from "react";
+import { Button } from "@/components/atoms/Button/Button";
+import { Text } from "@/components/atoms/Text/Text";
+import { Badge } from "@/components/atoms/Badge/Badge";
+import { useToast } from "@/components/molecules/Toast/use-toast";
+import type { ExecutionAnalyticsResponse } from "@/app/api/__generated__/models/executionAnalyticsResponse";
+import {
+  Copy01Icon,
+  Download04Icon,
+  EyeIcon,
+} from "@hugeicons/core-free-icons";
+import { Icon } from "@/components/atoms/Icon/Icon";
+
+interface Props {
+  results: ExecutionAnalyticsResponse;
+}
+
+export function AnalyticsResultsTable({ results }: Props) {
+  const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
+  const { toast } = useToast();
+
+  const createCopyableId = (value: string, label: string) => (
+    <div
+      className="group flex cursor-pointer items-center gap-1 font-mono text-caption text-foreground-tertiary hover:text-foreground-body"
+      onClick={() => {
+        navigator.clipboard.writeText(value);
+        toast({
+          title: "Copied",
+          description: `${label} copied to clipboard`,
+        });
+      }}
+      title={`Click to copy ${label.toLowerCase()}`}
+    >
+      {value.substring(0, 8)}...
+      <span className="block opacity-0 transition-opacity group-hover:opacity-100">
+        <Icon icon={Copy01Icon} className="h-3 w-3" />
+      </span>
+    </div>
+  );
+
+  const toggleRowExpansion = (execId: string) => {
+    const newExpanded = new Set(expandedRows);
+    if (newExpanded.has(execId)) {
+      newExpanded.delete(execId);
+    } else {
+      newExpanded.add(execId);
+    }
+    setExpandedRows(newExpanded);
+  };
+
+  const exportToCSV = () => {
+    const headers = [
+      "Agent ID",
+      "Version",
+      "User ID",
+      "Execution ID",
+      "Status",
+      "Score",
+      "Started At",
+      "Ended At",
+      "Summary Text",
+      "Error Message",
+    ];
+
+    const csvData = results.results.map((result) => [
+      result.agent_id,
+      result.version_id.toString(),
+      result.user_id,
+      result.exec_id,
+      result.status,
+      result.score?.toString() || "",
+      result.started_at ? new Date(result.started_at).toLocaleString() : "",
+      result.ended_at ? new Date(result.ended_at).toLocaleString() : "",
+      `"${(result.summary_text || "").replace(/"/g, '""')}"`, // Escape quotes in summary
+      `"${(result.error_message || "").replace(/"/g, '""')}"`, // Escape quotes in error
+    ]);
+
+    const csvContent = [
+      headers.join(","),
+      ...csvData.map((row) => row.join(",")),
+    ].join("\n");
+
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const link = document.createElement("a");
+    const url = URL.createObjectURL(blob);
+
+    link.setAttribute("href", url);
+    link.setAttribute(
+      "download",
+      `execution-analytics-results-${new Date().toISOString().split("T")[0]}.csv`,
+    );
+    link.style.visibility = "hidden";
+
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  const getStatusBadge = (status: string) => {
+    switch (status) {
+      case "success":
+        return <Badge variant="success">Success</Badge>;
+      case "failed":
+        return <Badge variant="error">Failed</Badge>;
+      case "skipped":
+        return <Badge variant="info">Skipped</Badge>;
+      default:
+        return <Badge variant="info">{status}</Badge>;
+    }
+  };
+
+  const getScoreDisplay = (score?: number) => {
+    if (score === undefined || score === null) return "—";
+
+    const percentage = Math.round(score * 100);
+    let colorClass = "";
+
+    if (score >= 0.8) colorClass = "text-success";
+    else if (score >= 0.6) colorClass = "text-yellow-foreground";
+    else if (score >= 0.4) colorClass = "text-orange-foreground";
+    else colorClass = "text-error-foreground";
+
+    return <span className={colorClass}>{percentage}%</span>;
+  };
+
+  return (
+    <div className="space-y-4">
+      {/* Summary Stats */}
+      <div className="rounded-lg bg-surface-muted p-4">
+        <Text variant="h3" className="mb-3">
+          Analytics Summary
+        </Text>
+        <div className="grid grid-cols-2 gap-4 text-body md:grid-cols-5">
+          <div>
+            <Text variant="body" tone="secondary">
+              Total Executions:
+            </Text>
+            <h4 className="font-poppins text-heading-sm font-semibold text-foreground-base">
+              {results.total_executions}
+            </h4>
+          </div>
+          <div>
+            <Text variant="body" tone="secondary">
+              Processed:
+            </Text>
+            <h4 className="font-poppins text-heading-sm font-semibold text-foreground-base">
+              {results.processed_executions}
+            </h4>
+          </div>
+          <div>
+            <Text variant="body" tone="secondary">
+              Successful:
+            </Text>
+            <h4 className="font-poppins text-heading-sm font-semibold text-success">
+              {results.successful_analytics}
+            </h4>
+          </div>
+          <div>
+            <Text variant="body" tone="secondary">
+              Failed:
+            </Text>
+            <h4 className="font-poppins text-heading-sm font-semibold text-error-foreground">
+              {results.failed_analytics}
+            </h4>
+          </div>
+          <div>
+            <Text variant="body" tone="secondary">
+              Skipped:
+            </Text>
+            <h4 className="font-poppins text-heading-sm font-semibold text-foreground-secondary">
+              {results.skipped_executions}
+            </h4>
+          </div>
+        </div>
+      </div>
+
+      {/* Export Button */}
+      <div className="flex justify-end">
+        <Button
+          variant="outline"
+          onClick={exportToCSV}
+          disabled={results.results.length === 0}
+        >
+          <Icon icon={Download04Icon} size={16} className="mr-2" />
+          Export CSV
+        </Button>
+      </div>
+
+      {/* Results Table */}
+      {results.results.length > 0 ? (
+        <div className="overflow-hidden rounded-lg border">
+          <div className="overflow-x-auto">
+            <table className="w-full">
+              <thead className="bg-surface-muted">
+                <tr>
+                  <th className="px-4 py-3 text-left">
+                    <Text variant="body-medium" tone="secondary">
+                      Agent ID
+                    </Text>
+                  </th>
+                  <th className="px-4 py-3 text-left">
+                    <Text variant="body-medium" tone="secondary">
+                      Version
+                    </Text>
+                  </th>
+                  <th className="px-4 py-3 text-left">
+                    <Text variant="body-medium" tone="secondary">
+                      User ID
+                    </Text>
+                  </th>
+                  <th className="px-4 py-3 text-left">
+                    <Text variant="body-medium" tone="secondary">
+                      Execution ID
+                    </Text>
+                  </th>
+                  <th className="px-4 py-3 text-left">
+                    <Text variant="body-medium" tone="secondary">
+                      Status
+                    </Text>
+                  </th>
+                  <th className="px-4 py-3 text-left">
+                    <Text variant="body-medium" tone="secondary">
+                      Score
+                    </Text>
+                  </th>
+                  <th className="px-4 py-3 text-left">
+                    <Text variant="body-medium" tone="secondary">
+                      Actions
+                    </Text>
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-border-base">
+                {results.results.map((result) => (
+                  <React.Fragment key={result.exec_id}>
+                    <tr className="hover:bg-surface-muted">
+                      <td className="px-4 py-3">
+                        {createCopyableId(result.agent_id, "Agent ID")}
+                      </td>
+                      <td className="px-4 py-3">
+                        <Text variant="body">{result.version_id}</Text>
+                      </td>
+                      <td className="px-4 py-3">
+                        {createCopyableId(result.user_id, "User ID")}
+                      </td>
+                      <td className="px-4 py-3">
+                        {createCopyableId(result.exec_id, "Execution ID")}
+                      </td>
+                      <td className="px-4 py-3">
+                        {getStatusBadge(result.status)}
+                      </td>
+                      <td className="px-4 py-3">
+                        {getScoreDisplay(
+                          typeof result.score === "number"
+                            ? result.score
+                            : undefined,
+                        )}
+                      </td>
+                      <td className="px-4 py-3">
+                        <Button
+                          variant="ghost"
+                          size="small"
+                          onClick={() => toggleRowExpansion(result.exec_id)}
+                        >
+                          <Icon icon={EyeIcon} size={16} />
+                        </Button>
+                      </td>
+                    </tr>
+
+                    {expandedRows.has(result.exec_id) && (
+                      <tr>
+                        <td colSpan={7} className="bg-surface-muted px-4 py-3">
+                          <div className="space-y-3">
+                            {/* Timestamps section */}
+                            <div className="grid grid-cols-2 gap-4 border-b border-border-base pb-3">
+                              <div>
+                                <Text
+                                  variant="small-medium-tight"
+                                  tone="secondary"
+                                >
+                                  Started At:
+                                </Text>
+                                <Text variant="body-tight" tone="body">
+                                  {result.started_at
+                                    ? new Date(
+                                        result.started_at,
+                                      ).toLocaleString()
+                                    : "—"}
+                                </Text>
+                              </div>
+                              <div>
+                                <Text
+                                  variant="small-medium-tight"
+                                  tone="secondary"
+                                >
+                                  Ended At:
+                                </Text>
+                                <Text variant="body-tight" tone="body">
+                                  {result.ended_at
+                                    ? new Date(result.ended_at).toLocaleString()
+                                    : "—"}
+                                </Text>
+                              </div>
+                            </div>
+
+                            {result.summary_text && (
+                              <div>
+                                <Text
+                                  variant="body-medium"
+                                  tone="body"
+                                  className="mb-1"
+                                >
+                                  Summary:
+                                </Text>
+                                <Text variant="body" tone="secondary">
+                                  {result.summary_text}
+                                </Text>
+                              </div>
+                            )}
+
+                            {result.error_message && (
+                              <div>
+                                <Text
+                                  variant="body-medium"
+                                  tone="danger"
+                                  className="mb-1"
+                                >
+                                  Error:
+                                </Text>
+                                <Text variant="body" tone="danger">
+                                  {result.error_message}
+                                </Text>
+                              </div>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </React.Fragment>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      ) : (
+        <div className="py-8 text-center">
+          <Text variant="body" tone="muted">
+            No executions were processed.
+          </Text>
+        </div>
+      )}
+    </div>
+  );
+}

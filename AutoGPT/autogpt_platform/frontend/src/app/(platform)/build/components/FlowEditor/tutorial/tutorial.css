@@ -1,0 +1,166 @@
+/* Tailwind 4 compiles each stylesheet on its own: this one reads the app's
+   theme from globals.css (for the @apply rules below) without emitting it. */
+@reference "../../../../../globals.css";
+
+.new-builder-tutorial-disable {
+  opacity: 0.3 !important;
+  pointer-events: none !important;
+  filter: grayscale(100%) !important;
+}
+
+.new-builder-tutorial-highlight {
+  position: relative;
+  z-index: 10;
+}
+
+.new-builder-tutorial-highlight * {
+  opacity: 1 !important;
+  filter: none !important;
+}
+
+.new-builder-tutorial-pulse {
+  animation: new-builder-tutorial-pulse 2s ease-in-out infinite;
+}
+
+@keyframes new-builder-tutorial-pulse {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 4px rgb(var(--color-surface)),
+      0 0 0 6px rgb(var(--color-brand)),
+      0 0 30px 8px rgb(var(--color-brand) / 0.4);
+  }
+  50% {
+    box-shadow:
+      0 0 0 4px rgb(var(--color-surface)),
+      0 0 0 8px rgb(var(--color-brand)),
+      0 0 40px 12px rgb(var(--color-brand) / 0.55);
+  }
+}
+
+.shepherd-element.new-builder-tour {
+  max-width: 420px !important;
+  border-radius: 1rem !important;
+  box-shadow:
+    0 0 0 1px rgb(var(--color-foreground-base) / 0.08),
+    0px 4px 6px -1px rgb(var(--color-foreground-base) / 0.1),
+    0 20px 25px -5px rgb(var(--color-foreground-base) / 0.1) !important;
+  background: rgb(var(--color-surface)) !important;
+  /* TODO(tokens): no exact text token: the family keeps its system-ui,
+     sans-serif fallback, which font-sans does not have. */
+  font-family: var(--font-geist-sans), system-ui, sans-serif !important;
+}
+
+.shepherd-element.new-builder-tour .shepherd-header {
+  padding: 1rem 1.25rem 0.5rem !important;
+  border-radius: 1rem 1rem 0 0 !important;
+  background: transparent !important;
+}
+
+.shepherd-element.new-builder-tour .shepherd-title {
+  /* TODO(tokens): no exact text token: the family keeps its system-ui,
+     sans-serif fallback, which font-poppins does not have. */
+  font-family: var(--font-poppins), system-ui, sans-serif !important;
+  @apply text-body-lg! leading-6! font-semibold!;
+  color: rgb(var(--color-foreground-base)) !important;
+}
+
+.shepherd-element.new-builder-tour .shepherd-text {
+  padding: 0 1.25rem 1rem !important;
+  color: rgb(var(--color-foreground-body)) !important;
+}
+
+.shepherd-element.new-builder-tour .shepherd-footer {
+  padding: 0.75rem 1.25rem 1rem !important;
+  border-top: 1px solid rgb(var(--color-border-base)) !important;
+  gap: 0.5rem !important;
+  display: flex !important;
+  justify-content: flex-end !important;
+}
+
+.shepherd-element.new-builder-tour .shepherd-button {
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  white-space: nowrap !important;
+  /* TODO(tokens): no exact text token: the family keeps its system-ui,
+     sans-serif fallback, which font-sans does not have. */
+  font-family: var(--font-geist-sans), system-ui, sans-serif !important;
+  @apply text-body! leading-5! font-medium!;
+  transition: all 150ms ease !important;
+  border-radius: 9999px !important; /* rounded-full */
+  min-width: 5rem !important;
+  padding: 0.5rem 1rem !important;
+  height: 2.25rem !important;
+  gap: 0.375rem !important;
+  cursor: pointer !important;
+}
+
+.shepherd-element.new-builder-tour
+  .shepherd-button:not(.shepherd-button-secondary) {
+  background-color: rgb(var(--color-action)) !important;
+  border: 1px solid rgb(var(--color-action)) !important;
+  color: rgb(var(--color-action-foreground)) !important;
+}
+
+.shepherd-element.new-builder-tour
+  .shepherd-button:not(.shepherd-button-secondary):hover {
+  background-color: rgb(var(--color-action-hover)) !important;
+  border-color: rgb(var(--color-action-hover)) !important;
+}
+
+.shepherd-element.new-builder-tour
+  .shepherd-button:not(.shepherd-button-secondary):active {
+  transform: scale(0.98);
+}
+
+.shepherd-element.new-builder-tour .shepherd-button-secondary {
+  background-color: rgb(var(--color-surface-hover)) !important;
+  border: 1px solid rgb(var(--color-surface-hover)) !important;
+  color: rgb(var(--color-foreground-body)) !important;
+}
+
+.shepherd-element.new-builder-tour .shepherd-button-secondary:hover {
+  background-color: rgb(var(--color-surface-active)) !important;
+  border-color: rgb(var(--color-surface-active)) !important;
+  color: rgb(var(--color-foreground-strong)) !important;
+}
+
+.shepherd-element.new-builder-tour .shepherd-button-secondary:active {
+  transform: scale(0.98);
+}
+
+.shepherd-element.new-builder-tour .shepherd-cancel-icon {
+  color: rgb(var(--color-foreground-subtle)) !important;
+  transition: color 150ms ease !important;
+  width: 1.5rem !important;
+  height: 1.5rem !important;
+}
+
+.shepherd-element.new-builder-tour .shepherd-cancel-icon:hover {
+  color: rgb(var(--color-foreground-body)) !important;
+}
+
+.shepherd-element.new-builder-tour .shepherd-arrow {
+  transform: scale(1.2) !important;
+}
+
+.shepherd-element.new-builder-tour .shepherd-arrow:before {
+  background: rgb(var(--color-surface)) !important;
+}
+
+.shepherd-element.new-builder-tour[data-popper-placement^="top"] {
+  margin-bottom: 40px !important;
+}
+
+.shepherd-element.new-builder-tour[data-popper-placement^="bottom"] {
+  margin-top: 40px !important;
+}
+
+.shepherd-element.new-builder-tour[data-popper-placement^="left"] {
+  margin-right: 30px !important;
+}
+
+.shepherd-element.new-builder-tour[data-popper-placement^="right"] {
+  margin-left: 30px !important;
+}

@@ -1,0 +1,66 @@
+"use client";
+
+import type { OutputMetadata } from "@/components/contextual/OutputRenderers";
+import { globalRegistry } from "@/components/contextual/OutputRenderers";
+import { Text } from "@/components/atoms/Text/Text";
+
+export const TextRenderer: React.FC<{
+  value: any;
+  truncateLengthLimit?: number;
+}> = ({ value, truncateLengthLimit = 100 }) => {
+  const text =
+    typeof value === "object" ? JSON.stringify(value, null, 2) : String(value);
+  const truncated =
+    truncateLengthLimit && text.length > truncateLengthLimit
+      ? text.slice(0, truncateLengthLimit) + "..."
+      : text;
+
+  return (
+    <div className="bg-surface-muted p-3">
+      <Text
+        variant="small-tight"
+        tone="inherit"
+        as="div"
+        className="break-words"
+      >
+        {truncated}
+      </Text>
+    </div>
+  );
+};
+
+export const ContentRenderer: React.FC<{
+  value: any;
+  shortContent?: boolean;
+}> = ({ value, shortContent = false }) => {
+  const metadata: OutputMetadata = {};
+
+  if (typeof value === "object" && value !== null) {
+    if (value.type) metadata.type = value.type;
+    if (value.mimeType) metadata.mimeType = value.mimeType;
+    if (value.filename) metadata.filename = value.filename;
+  }
+
+  const renderer = globalRegistry.getRenderer(value, metadata);
+
+  if (
+    renderer?.name === "ImageRenderer" ||
+    renderer?.name === "VideoRenderer" ||
+    renderer?.name === "WorkspaceFileRenderer" ||
+    renderer?.name === "AudioRenderer" ||
+    renderer?.name === "LinkRenderer" ||
+    !shortContent
+  ) {
+    return (
+      <div className="overflow-x-auto [&_pre]:break-words [&_pre]:whitespace-pre-wrap [&>*]:rounded-xlarge [&>*]:!text-caption [&>*]:!leading-4">
+        {renderer?.render(value, metadata)}
+      </div>
+    );
+  }
+
+  return (
+    <div className="overflow-x-auto [&>*]:rounded-xlarge">
+      <TextRenderer value={value} truncateLengthLimit={200} />
+    </div>
+  );
+};

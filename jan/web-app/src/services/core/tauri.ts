@@ -1,0 +1,38 @@
+/**
+ * Tauri Core Service - Desktop implementation
+ */
+
+import { invoke, convertFileSrc } from '@tauri-apps/api/core'
+import type { InvokeArgs } from './types'
+import { DefaultCoreService } from './default'
+
+export class TauriCoreService extends DefaultCoreService {
+  async invoke<T = unknown>(command: string, args?: InvokeArgs): Promise<T> {
+    try {
+      return await invoke<T>(command, args)
+    } catch (error) {
+      console.error(`Error invoking Tauri command '${command}' in Tauri:`, error)
+      throw error
+    }
+  }
+
+  convertFileSrc(filePath: string, protocol?: string): string {
+    try {
+      return convertFileSrc(filePath, protocol)
+    } catch (error) {
+      console.error('Error converting file src in Tauri:', error)
+      return filePath
+    }
+  }
+
+  // App token
+  async getAppToken(): Promise<string | null> {
+    try {
+      const result = await this.invoke<string | null>('app_token')
+      return result
+    } catch (error) {
+      console.error('Error getting app token in Tauri:', error)
+      return null
+    }
+  }
+}

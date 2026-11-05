@@ -1,0 +1,109 @@
+import { getFieldDomId } from "../../../field-accessibility";
+import {
+  FormContextType,
+  IconButtonProps,
+  RJSFSchema,
+  StrictRJSFSchema,
+  TranslatableString,
+} from "@rjsf/utils";
+
+import { Button } from "@/components/atoms/Button/Button";
+import { cn } from "@/lib/utils";
+import { Text } from "@/components/atoms/Text/Text";
+import {
+  ArrowDown01Icon,
+  ArrowUp01Icon,
+  Copy01Icon,
+  Delete02Icon,
+} from "@hugeicons/core-free-icons";
+import { Icon } from "@/components/atoms/Icon/Icon";
+
+export type AutogptIconButtonProps<
+  T = any,
+  S extends StrictRJSFSchema = RJSFSchema,
+  F extends FormContextType = any,
+> = IconButtonProps<T, S, F> & { size?: "small" | "icon" };
+
+export default function IconButton(props: AutogptIconButtonProps) {
+  const {
+    icon,
+    className,
+    uiSchema: _uiSchema,
+    registry,
+    id,
+    title,
+    iconType: _iconType,
+    size = "icon",
+    ...otherProps
+  } = props;
+
+  return (
+    <Button
+      size={size}
+      variant="secondary"
+      className={cn(className, "w-fit p-1.5 px-4")}
+      {...otherProps}
+      id={id ? getFieldDomId(id, registry.formContext) : undefined}
+      title={title}
+      aria-label={title}
+      type="button"
+    >
+      {icon}
+      <Text variant="body" className="ml-2">
+        {title}
+      </Text>
+    </Button>
+  );
+}
+
+export function CopyButton(props: AutogptIconButtonProps) {
+  const {
+    registry: { translateString },
+  } = props;
+  return (
+    <IconButton
+      title={translateString(TranslatableString.CopyButton)}
+      {...props}
+      icon={<Icon aria-hidden icon={Copy01Icon} className="h-4 w-4" />}
+    />
+  );
+}
+
+export function MoveDownButton(props: AutogptIconButtonProps) {
+  const {
+    registry: { translateString },
+  } = props;
+  return (
+    <IconButton
+      title={translateString(TranslatableString.MoveDownButton)}
+      {...props}
+      icon={<Icon aria-hidden icon={ArrowDown01Icon} className="h-4 w-4" />}
+    />
+  );
+}
+
+export function MoveUpButton(props: AutogptIconButtonProps) {
+  const {
+    registry: { translateString },
+  } = props;
+  return (
+    <IconButton
+      title={translateString(TranslatableString.MoveUpButton)}
+      {...props}
+      icon={<Icon aria-hidden icon={ArrowUp01Icon} className="h-4 w-4" />}
+    />
+  );
+}
+
+export function RemoveButton(props: AutogptIconButtonProps) {
+  const {
+    registry: { translateString },
+  } = props;
+  return (
+    <IconButton
+      title={translateString(TranslatableString.RemoveButton)}
+      {...props}
+      icon={<Icon icon={Delete02Icon} size={16} tone="emphasis" />}
+    />
+  );
+}

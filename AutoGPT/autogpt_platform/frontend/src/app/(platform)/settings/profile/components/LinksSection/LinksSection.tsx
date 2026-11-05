@@ -1,0 +1,107 @@
+"use client";
+
+import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
+import { Button } from "@/components/atoms/Button/Button";
+import { Text } from "@/components/atoms/Text/Text";
+
+import { type LinkRow, MAX_LINKS } from "../../helpers";
+import {
+  Delete02Icon,
+  Link02Icon,
+  PlusSignIcon,
+} from "@hugeicons/core-free-icons";
+import { Icon } from "@/components/atoms/Icon/Icon";
+
+interface Props {
+  links: LinkRow[];
+  onChange: (index: number, value: string) => void;
+  onAdd: () => void;
+  onRemove: (index: number) => void;
+}
+
+const EASE_OUT = [0.16, 1, 0.3, 1] as const;
+
+export function LinksSection({ links, onChange, onAdd, onRemove }: Props) {
+  const reduceMotion = useReducedMotion();
+  const canAdd = links.length < MAX_LINKS;
+
+  return (
+    <motion.div
+      initial={reduceMotion ? { opacity: 0 } : { opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.32, ease: EASE_OUT, delay: 0.12 }}
+      className="flex flex-col gap-4"
+    >
+      <div className="flex flex-col gap-1 px-4">
+        <Text variant="body-medium" as="span">
+          Your links
+        </Text>
+        <Text variant="small" tone="muted">
+          Add up to {MAX_LINKS} links. Site, GitHub, X, anything you want
+          visible.
+        </Text>
+      </div>
+
+      <div className="flex flex-col gap-3">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <AnimatePresence initial={false}>
+            {links.map((link, index) => (
+              <motion.div
+                key={link.id}
+                layout={!reduceMotion}
+                initial={
+                  reduceMotion ? { opacity: 0 } : { opacity: 0, scale: 0.97 }
+                }
+                animate={{ opacity: 1, scale: 1 }}
+                exit={
+                  reduceMotion ? { opacity: 0 } : { opacity: 0, scale: 0.97 }
+                }
+                transition={{ duration: 0.18, ease: EASE_OUT }}
+              >
+                <div className="flex items-center gap-2">
+                  <div className="flex flex-1 items-center gap-2 rounded-3xl border border-border-base bg-surface px-4 text-foreground-subtle transition-colors duration-150 focus-within:border-brand/80 focus-within:ring-1 focus-within:ring-brand/80">
+                    <Icon icon={Link02Icon} size={16} />
+                    <input
+                      type="url"
+                      value={link.value}
+                      placeholder="https://"
+                      aria-label={`Link ${index + 1}`}
+                      onChange={(e) => onChange(index, e.target.value)}
+                      className="h-[2.875rem] w-full border-none bg-transparent text-body text-foreground-base placeholder:text-foreground-subtle focus:outline-none"
+                    />
+                  </div>
+                  <Button
+                    variant="icon"
+                    size="icon"
+                    aria-label={`Remove link ${index + 1}`}
+                    onClick={() => onRemove(index)}
+                  >
+                    <Icon icon={Delete02Icon} size={16} />
+                  </Button>
+                </div>
+              </motion.div>
+            ))}
+          </AnimatePresence>
+        </div>
+
+        {links.length === 0 ? (
+          <Text variant="small" tone="subtle" className="mx-4">
+            No links yet.
+          </Text>
+        ) : null}
+
+        <div>
+          <Button
+            variant="ghost"
+            size="small"
+            leftIcon={<Icon icon={PlusSignIcon} size={16} />}
+            onClick={onAdd}
+            disabled={!canAdd}
+          >
+            {canAdd ? "Add link" : `Limit of ${MAX_LINKS} reached`}
+          </Button>
+        </div>
+      </div>
+    </motion.div>
+  );
+}

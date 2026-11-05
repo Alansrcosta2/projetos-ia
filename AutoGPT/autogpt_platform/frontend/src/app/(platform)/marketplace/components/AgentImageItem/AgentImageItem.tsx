@@ -1,0 +1,113 @@
+import { Button } from "@/components/atoms/Button/Button";
+import { Skeleton } from "@/components/atoms/Skeleton/Skeleton";
+import Image from "next/image";
+import { isLocalStoreMediaUrl } from "@/lib/store-media";
+import { useEffect, useState } from "react";
+import { isValidVideoFile, isValidVideoUrl } from "./helpers";
+import { useAgentImageItem } from "./useAgentImageItem";
+import { ImageNotFound01Icon, PlayIcon } from "@hugeicons/core-free-icons";
+import { Icon } from "@/components/atoms/Icon/Icon";
+import { useImageFallback } from "@/hooks/useImageFallback";
+import { YouTubeEmbed } from "@/components/molecules/YouTubeEmbed/YouTubeEmbed";
+import { isYouTubeUrl } from "@/components/molecules/YouTubeEmbed/helpers";
+
+interface AgentImageItemProps {
+  image: string;
+  index: number;
+  playingVideoIndex: number | null;
+  handlePlay: (index: number) => void;
+  handlePause: (index: number) => void;
+}
+
+export function AgentImageItem({
+  image,
+  index,
+  playingVideoIndex,
+  handlePlay,
+  handlePause,
+}: AgentImageItemProps) {
+  const { videoRef } = useAgentImageItem({ playingVideoIndex, index });
+  const isVideoFile = isValidVideoFile(image);
+  const [imageLoaded, setImageLoaded] = useState(false);
+  const { showImage, handleImageError } = useImageFallback(image);
+
+  useEffect(() => {
+    setImageLoaded(false);
+  }, [image]);
+
+  return (
+    <div className="relative">
+      <div className="h-[15rem] overflow-hidden rounded-xl border border-separator bg-foreground-subtle sm:h-[20rem] sm:w-full md:h-[25rem] lg:h-[30rem]">
+        {isValidVideoUrl(image) ? (
+          isYouTubeUrl(image) ? (
+            <YouTubeEmbed url={image} />
+          ) : (
+            <div className="relative h-full w-full overflow-hidden">
+              <video
+                ref={videoRef}
+                className="absolute inset-0 h-full w-full object-cover object-[center_25%]"
+                controls
+                preload="metadata"
+                poster={`${image}#t=0.1`}
+                onPlay={() => handlePlay(index)}
+                onPause={() => handlePause(index)}
+                autoPlay={false}
+                title="Video"
+              >
+                <source src={image} type="video/mp4" />
+                Your browser does not support the video tag.
+              </video>
+            </div>
+          )
+        ) : (
+          <div className="relative h-full w-full">
+            {showImage ? (
+              <>
+                {!imageLoaded && (
+                  <Skeleton className="absolute inset-0 rounded-xl" />
+                )}
+                <Image
+                  src={image}
+                  unoptimized={isLocalStoreMediaUrl(image)}
+                  alt="Image"
+                  fill
+                  sizes="(max-width: 768px) 100vw, (max-width: 1200px) 50vw, 33vw"
+                  className="rounded-xl object-cover"
+                  onLoad={() => setImageLoaded(true)}
+                  onError={handleImageError}
+                />
+              </>
+            ) : (
+              <div className="flex h-full w-full items-center justify-center rounded-xl bg-surface-hover text-foreground-subtle">
+                <Icon icon={ImageNotFound01Icon} className="h-10 w-10" />
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+      {isVideoFile && playingVideoIndex !== index && (
+        <div className="absolute bottom-2 left-2 sm:bottom-3 sm:left-3 md:bottom-4 md:left-4 lg:bottom-[1.25rem] lg:left-[1.25rem]">
+          <Button
+            variant="secondary"
+            size="large"
+            onClick={() => {
+              if (videoRef.current) {
+                videoRef.current.play();
+              }
+            }}
+            rightIcon={
+              <Icon
+                icon={PlayIcon}
+                size={20}
+                tone="base"
+                className="sm:h-6 sm:w-6 md:h-7 md:w-7"
+              />
+            }
+          >
+            Play demo
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}

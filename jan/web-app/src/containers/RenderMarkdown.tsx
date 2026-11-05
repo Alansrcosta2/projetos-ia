@@ -1,0 +1,509 @@
+
+import { Components, ExtraProps } from 'react-markdown'
+import { memo, useDeferredValue, useMemo } from 'react'
+import {
+  cn,
+  disableIndentedCodeBlockPlugin,
+  splitHtmlArtifacts,
+} from '@/lib/utils'
+import { useInterfaceSettings } from '@/hooks/useInterfaceSettings'
+import { HtmlArtifact } from '@/components/HtmlArtifact'
+// import 'katex/dist/katex.min.css'
+import {
+  defaultRehypePlugins,
+  Streamdown,
+  type MermaidErrorComponentProps,
+} from 'streamdown'
+import { cjk } from '@streamdown/cjk'
+import { code } from '@streamdown/code'
+import { mermaid } from '@streamdown/mermaid'
+
+import { SKIP, visit } from 'unist-util-visit'
+import type { Root } from 'hast'
+import remarkGfm from 'remark-gfm'
+import remarkMath from 'remark-math'
+import rehypeKatex from 'rehype-katex'
+import 'katex/dist/katex.min.css'
+import { MermaidError } from '@/components/MermaidError'
+import { CitationLink } from '@/components/CitationLink'
+import { WebCitationChip } from '@/components/WebCitationChip'
+import { MarkdownTable } from '@/components/MarkdownTable'
+import { externalHref, openExternalUrl } from '@/lib/externalLink'
+import {
+  useRemoteImagesAllowed,
+  withRemoteImages,
+} from '@/lib/extensions/remoteImages'
+
+// Do not resolve model-generated links against the app's own origin.
+function isWebLink(href: string | undefined): boolean {
+  if (!href || !/^https?:\/\//i.test(href)) return false
+  try {
+    const { protocol } = new URL(href)
+    return protocol === 'http:' || protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
+// Citation fragments are model-controlled too: decode defensively and apply the
+// same absolute HTTP(S) policy before letting a chip create its own anchors.
+function webCitationUrl(href: string | undefined): string | undefined {
+  if (!href?.startsWith('#webcite-')) return undefined
+  try {
+    const url = decodeURIComponent(href.slice('#webcite-'.length))
+    return isWebLink(url) ? url : undefined
+  } catch {
+    return undefined
+  }
+}
+
+// The hardener normalizes URLs (including repairing incomplete HTTP schemes)
+// and annotates rejected anchors with " [blocked]". Unwrap them first so only
+// their original, formatted label survives.
+function restrictChatLinks() {
+  return (tree: Root) => {
+    visit(tree, 'element', (node, index, parent) => {
+      if (node.tagName !== 'a') return
+      const href = node.properties.href
+      if (
+        typeof href === 'string' &&
+        (href.startsWith('#cite-') || webCitationUrl(href) || isWebLink(href))
+      ) {
+        return
+      }
+      if (parent && index !== undefined) {
+        parent.children.splice(index, 1, ...node.children)
+        return [SKIP, index]
+      }
+    })
+  }
+}
+
+// Replaces every <img> whose source is not an inline `data:` image with its
+// alt text. Runs after the hardener, which resolves relative and
+// protocol-relative sources, so anything left that is not `data:` would make
+// a request.
+function dropRemoteImages() {
+  return (tree: Root) => {
+    visit(tree, 'element', (node, index, parent) => {
+      if (node.tagName !== 'img' || !parent || index === undefined) return
+      const src = node.properties.src
+      if (typeof src === 'string' && src.startsWith('data:image/')) return
+      const alt = node.properties.alt
+      parent.children.splice(
+        index,
+        1,
+        ...(typeof alt === 'string' && alt
+          ? [{ type: 'text' as const, value: alt }]
+          : [])
+      )
+      return [SKIP, index]
+    })
+  }
+}
+
+const WEB_CITE_MARKER = /\[\[cite:\s*([^\]\s]+?)\s*\]\]/g
+
+// Models sometimes drop the scheme (e.g. "example.com/x"); normalize to https.
+function normalizeCiteUrl(raw: string): string {
+  return /^https?:\/\//i.test(raw) ? raw : `https://${raw}`
+}
+
+// Convert model-emitted [[cite:URL]] markers into anchors the Anchor override
+// renders as circular favicon chips.
+function linkifyWebCitations(text: string): string {
+  if (!text.includes('[[cite:')) return text
+  return text.replace(
+    WEB_CITE_MARKER,
+    (_m, url: string) =>
+      `[cite](#webcite-${encodeURIComponent(normalizeCiteUrl(url))})`
+  )
+}
+
+interface MarkdownProps {
+  content: string
+  className?: string
+  components?: Components
+  isUser?: boolean
+  isStreaming?: boolean
+  messageId?: string
+  isAnimating?: boolean
+  /**
+   * Content a third-party extension authored (see lib/extensions/authorship).
+   * Remote images, mermaid diagrams and citation favicons are not loaded:
+   * the app's img-src allows any https host, so any of them would let the
+   * extension reach a host it holds no `network:` grant for. Inline `data:`
+   * images still render. Also on whenever `RemoteImagesContext` is off.
+   */
+  noRemoteImages?: boolean
+}
+
+// Hoisted so their identity is stable across renders — Streamdown is memoized
+// with a shallow prop compare, and fresh literals here would defeat it, forcing
+// a full re-parse + re-highlight on every streamed token.
+const REMARK_PLUGINS = [remarkGfm, remarkMath, disableIndentedCodeBlockPlugin]
+const REHYPE_PLUGINS = [rehypeKatex, restrictChatLinks, defaultRehypePlugins.harden]
+const NO_REMOTE_IMAGE_REHYPE_PLUGINS = [...REHYPE_PLUGINS, dropRemoteImages]
+const STREAMDOWN_PLUGINS = { code, mermaid, cjk }
+// Mermaid draws in the browser, after the rehype pass, and its image shape
+// (`A@{ img: "https://..." }`) loads whatever URL the diagram names. Content
+// an extension authored keeps its diagrams as code blocks instead.
+const NO_REMOTE_IMAGE_STREAMDOWN_PLUGINS = { code, cjk }
+const STREAMDOWN_CONTROLS = { mermaid: { fullscreen: false } }
+const LINK_SAFETY = { enabled: false }
+const EMPTY_MERMAID = {}
+
+// While streaming, the active (unclosed) code block would be re-highlighted by
+// Shiki over its whole contents on every commit — O(n) per render, and the
+// highlighted DOM is re-inserted wholesale (slow on webkitgtk). Render plain
+// text instead; Streamdown's Shiki CodeBlock takes over once streaming ends.
+type CodeProps = React.HTMLAttributes<HTMLElement> & ExtraProps
+function StreamingCode({ node, className, children, ...props }: CodeProps) {
+  const pos = node?.position
+  const isInline = !pos || pos.start.line === pos.end.line
+  if (isInline) {
+    return (
+      <code
+        className={cn(
+          'rounded bg-muted px-1.5 py-0.5 font-mono text-sm',
+          className
+        )}
+        {...props}
+      >
+        {children}
+      </code>
+    )
+  }
+  return (
+    <pre className="my-4 overflow-x-auto rounded-lg border border-border bg-secondary p-4">
+      <code className={cn('font-mono text-sm', className)}>{children}</code>
+    </pre>
+  )
+}
+const STREAMING_COMPONENTS: Components = { code: StreamingCode }
+
+const ZWSP = '​'
+
+// "word**,**" is neither left- nor right-flanking per CommonMark, so the markers
+// render literally; a ZWSP just inside restores flanking (U+200B is treated as
+// non-punctuation). Runs after math/code are masked, so '_'/'*' subscripts never
+// get a ZWSP — that made KaTeX warn "Unrecognized Unicode character 8203".
+const fixEmphasisFlanking = (s: string): string =>
+  s.includes('*') || s.includes('_')
+    ? s
+        .replace(/(?<=[\p{L}\p{N}])(\*\*?|__?)(?=[^\s\p{L}\p{N}*_])/gu, `$1${ZWSP}`)
+        .replace(/(?<=[^\s\p{L}\p{N}*_])(\*\*?|__?)(?=[\p{L}\p{N}])/gu, `${ZWSP}$1`)
+    : s
+
+// Placeholder-protection pipeline (adapted from llama.cpp's webui / LibreChat):
+// remark-math only parses $…$/$$…$$, so brackets need converting — but converting,
+// escaping currency, and fixing emphasis would corrupt each other unless code and
+// math are first lifted out as opaque tokens. PUA-delimited tokens can't occur in
+// model output and are inert to every transform here.
+const CODE_BLOCK = /(```[\s\S]*?```|`[^`\n]+`)/g
+const BRACKET_MATH =
+  /(\$\$[\s\S]*?\$\$|(?<!\\)\\\[[\s\S]*?\\\]|(?<!\\)\\\(.*?\\\))/g
+const tok = (kind: 'C' | 'L', n: number) => `\uE000${kind}${n}\uE000`
+
+// Mask genuine inline $…$ math; leave currency/identifiers ($5, a$b) in place.
+// Per-line so a stray $ can't swallow the rest.
+const maskInlineMath = (content: string, store: string[]): string => {
+  if (!content.includes('$')) return content
+  return content
+    .split('\n')
+    .map((line) => {
+      if (!line.includes('$')) return line
+      let out = ''
+      let pos = 0
+      while (pos < line.length) {
+        const open = line.indexOf('$', pos)
+        if (open === -1) {
+          out += line.slice(pos)
+          break
+        }
+        const close = line.indexOf('$', open + 1)
+        if (close === -1) {
+          out += line.slice(pos)
+          break
+        }
+
+        const before = open > 0 ? line[open - 1] : ''
+        const afterOpen = line[open + 1]
+        const beforeClose = open + 1 < close ? line[close - 1] : ''
+        const afterClose = close + 1 < line.length ? line[close + 1] : ''
+
+        const empty = close === open + 1
+        const gluedLeft = /[A-Za-z0-9_$-]/.test(before)
+        const looksMoney =
+          /[0-9]/.test(afterOpen) &&
+          (/[A-Za-z0-9_$-]/.test(afterClose) || beforeClose === ' ')
+
+        if (empty || gluedLeft || looksMoney) {
+          out += line.slice(pos, open + 1)
+          pos = open + 1
+          continue
+        }
+
+        out += line.slice(pos, open)
+        store.push(line.slice(open, close + 1))
+        out += tok('L', store.length - 1)
+        pos = close + 1
+      }
+      return out
+    })
+    .join('\n')
+}
+
+// Cache for normalized LaTeX content
+const latexCache = new Map<string, string>()
+
+const normalizeLatex = (input: string): string => {
+  if (latexCache.has(input)) return latexCache.get(input)!
+
+  const code: string[] = []
+  const math: string[] = []
+
+  let s = input
+    .replace(CODE_BLOCK, (m) => tok('C', code.push(m) - 1))
+    .replace(BRACKET_MATH, (m) => tok('L', math.push(m) - 1))
+
+  s = maskInlineMath(s, math)
+  s = s.replace(/\$(?=\d)/g, '\\$') // leftover currency renders literally
+  s = fixEmphasisFlanking(s)
+
+  // Restore math, converting bracket delimiters to $… / $$… for remark-math.
+  s = s.replace(/\uE000L(\d+)\uE000/g, (_, n) => {
+    const expr = math[Number(n)]
+    if (expr.startsWith('\\[')) return `$$\n${expr.slice(2, -2).trim()}\n$$`
+    if (expr.startsWith('\\(')) return `$${expr.slice(2, -2).trim()}$`
+    return expr
+  })
+  s = s.replace(/\uE000C(\d+)\uE000/g, (_, n) => code[Number(n)])
+
+  if (latexCache.size > 100) {
+    const firstKey = latexCache.keys().next().value || ''
+    latexCache.delete(firstKey)
+  }
+  latexCache.set(input, s)
+  return s
+}
+
+function RenderMarkdownComponent({
+  content,
+  className,
+  isUser,
+  components,
+  messageId,
+  isAnimating,
+  isStreaming,
+  noRemoteImages: noRemoteImagesProp,
+}: MarkdownProps) {
+  const remoteImagesAllowed = useRemoteImagesAllowed()
+  const noRemoteImages = noRemoteImagesProp || !remoteImagesAllowed
+  const renderHtmlArtifacts = useInterfaceSettings(
+    (s) => s.renderHtmlArtifacts
+  )
+
+  // Coalesce rapid streamed updates: React renders the deferred (older) value
+  // while new tokens arrive and skips intermediates under load, so the memoized
+  // Streamdown subtree re-renders far less than once per token. Always converges
+  // to the latest value, so it can't get stuck. Non-streaming uses content as-is.
+  const deferredContent = useDeferredValue(content)
+  const effectiveContent = isStreaming ? deferredContent : content
+
+  // normalizeLatex is O(n) over the full string and its cache misses every chunk;
+  // skip it while streaming (LaTeX can't render mid-token) to avoid O(n²) cost.
+  const normalizedContent = useMemo(
+    () =>
+      linkifyWebCitations(
+        isStreaming ? effectiveContent : normalizeLatex(effectiveContent)
+      ),
+    [effectiveContent, isStreaming]
+  )
+
+  const mergedComponents = useMemo<Components>(() => {
+    const Anchor = (
+      props: React.AnchorHTMLAttributes<HTMLAnchorElement>
+    ) => {
+      const { href, children, className: aClass } = props
+      if (typeof href === 'string' && href.startsWith('#cite-')) {
+        return (
+          <CitationLink href={href} className={aClass}>
+            {children}
+          </CitationLink>
+        )
+      }
+      if (typeof href === 'string' && href.startsWith('#webcite-')) {
+        const url = webCitationUrl(href)
+        return url ? (
+          <WebCitationChip messageId={messageId} url={url} />
+        ) : (
+          <>{children}</>
+        )
+      }
+      // Keep the HTTP(S)-only chat policy even if the hardener repairs a URL.
+      if (!isWebLink(href)) return <>{children}</>
+      // Model and tool output must never navigate the app window. Open
+      // allowed web links outside the app, without a second new-window request.
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const { node: _node, href: _href, target: _target, ...rest } = props as
+        typeof props & { node?: unknown }
+      const external = externalHref(href)
+      if (external) {
+        return (
+          <a
+            {...rest}
+            href={external}
+            // No target="_blank": see ExternalAnchor for why.
+            rel="noopener noreferrer"
+            onClick={(e) => {
+              e.preventDefault()
+              openExternalUrl(external)
+            }}
+          >
+            {children}
+          </a>
+        )
+      }
+      return <>{children}</>
+    }
+    return { a: Anchor, table: MarkdownTable, ...(components ?? {}) } as Components
+  }, [components, messageId])
+
+  // Interactive HTML artifacts: only when the user opted in and the stream is
+  // complete (an incomplete fence must not be torn out mid-token). Splitting the
+  // string keeps Streamdown's code/mermaid/inline handling intact for everything
+  // else — overriding its `code` component would replace all of it.
+  const segments = useMemo(() => {
+    if (isStreaming || !renderHtmlArtifacts) return null
+    const segs = splitHtmlArtifacts(normalizedContent)
+    return segs.some((s) => s.type === 'html' || s.type === 'svg')
+      ? segs
+      : null
+  }, [normalizedContent, isStreaming, renderHtmlArtifacts])
+
+  return withRemoteImages(
+    !noRemoteImages,
+    <div
+      dir="auto"
+      className={cn(
+        'markdown wrap-break-word select-text',
+        isUser && 'is-user',
+        className
+      )}
+    >
+      {segments
+        ? segments.map((seg, i) =>
+            seg.type === 'html' ? (
+              <HtmlArtifact key={i} code={seg.content} />
+            ) : seg.type === 'svg' ? (
+              <HtmlArtifact
+                key={i}
+                code={seg.content}
+                allowScripts={false}
+                language="xml"
+              />
+            ) : (
+              <StreamdownView
+                key={i}
+                content={seg.content}
+                isStreaming={isStreaming}
+                isAnimating={isAnimating}
+                messageId={messageId}
+                className={className}
+                components={mergedComponents}
+                noRemoteImages={noRemoteImages}
+              />
+            )
+          )
+        : (
+          <StreamdownView
+            content={normalizedContent}
+            isStreaming={isStreaming}
+            isAnimating={isAnimating}
+            messageId={messageId}
+            className={className}
+            components={mergedComponents}
+            noRemoteImages={noRemoteImages}
+          />
+        )}
+    </div>
+  )
+}
+
+interface StreamdownViewProps {
+  content: string
+  components: Components
+  className?: string
+  isStreaming?: boolean
+  isAnimating?: boolean
+  messageId?: string
+  noRemoteImages?: boolean
+}
+
+function StreamdownViewComponent({
+  content,
+  components,
+  className,
+  isStreaming,
+  isAnimating,
+  messageId,
+  noRemoteImages,
+}: StreamdownViewProps) {
+  const mermaidOptions = useMemo(
+    () =>
+      messageId
+        ? {
+            errorComponent: (props: MermaidErrorComponentProps) => (
+              <MermaidError messageId={messageId} {...props} />
+            ),
+          }
+        : EMPTY_MERMAID,
+    [messageId]
+  )
+
+  const mergedClassName = useMemo(
+    () =>
+      cn('size-full [&>*:first-child]:mt-0 [&>*:last-child]:mb-0', className),
+    [className]
+  )
+
+  // Skip Shiki on the in-progress code block while streaming.
+  const effectiveComponents = useMemo(
+    () =>
+      isStreaming ? { ...components, ...STREAMING_COMPONENTS } : components,
+    [components, isStreaming]
+  )
+
+  return (
+    <Streamdown
+      mode={isStreaming ? 'streaming' : 'static'}
+      parseIncompleteMarkdown={isStreaming ?? false}
+      animate={isStreaming ? false : (isAnimating ?? true)}
+      animationDuration={500}
+      linkSafety={LINK_SAFETY}
+      className={mergedClassName}
+      remarkPlugins={REMARK_PLUGINS}
+      rehypePlugins={
+        noRemoteImages ? NO_REMOTE_IMAGE_REHYPE_PLUGINS : REHYPE_PLUGINS
+      }
+      components={effectiveComponents}
+      plugins={
+        noRemoteImages ? NO_REMOTE_IMAGE_STREAMDOWN_PLUGINS : STREAMDOWN_PLUGINS
+      }
+      controls={STREAMDOWN_CONTROLS}
+      mermaid={mermaidOptions}
+    >
+      {content}
+    </Streamdown>
+  )
+}
+
+const StreamdownView = memo(StreamdownViewComponent)
+export const RenderMarkdown = memo(
+  RenderMarkdownComponent,
+  (prevProps, nextProps) =>
+    prevProps.content === nextProps.content &&
+    prevProps.isStreaming === nextProps.isStreaming &&
+    prevProps.noRemoteImages === nextProps.noRemoteImages
+)

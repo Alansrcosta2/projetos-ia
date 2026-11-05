@@ -1,0 +1,78 @@
+import { useEffect } from 'react'
+import { getServiceHub } from '@/hooks/useServiceHub'
+import { SystemEvent } from '@/types/events'
+import { useAppState } from './useAppState'
+import { mcpOrchestrator } from '@/lib/mcp-orchestrator/mcp-orchestrator'
+import { useContributions } from '@/lib/extensions/contributions'
+import { listExtensionTools } from '@/lib/extensions/tools'
+
+export const useTools = () => {
+  const updateTools = useAppState((state) => state.updateTools)
+  const updateRagToolNames = useAppState((state) => state.updateRagToolNames)
+  const updateMcpToolNames = useAppState((state) => state.updateMcpToolNames)
+  const updateExtensionTools = useAppState(
+    (state) => state.updateExtensionTools
+  )
+
+  useEffect(() => {
+    async function setTools() {
+      try {
+        // A server connect/disconnect/tools-refresh fired this (mcp-update);
+        // the orchestrator's per-request tool cache would otherwise only
+        // notice via its own TTL, serving stale/reordered tools in the
+        // meantime and destabilizing the KV-cache prefix Jan sends.
+        mcpOrchestrator.invalidateCache()
+
+        // Fetch tools and tool names in parallel
+        const [mcpTools, ragToolNames] = await Promise.all([
+          getServiceHub().mcp().getTools(),
+          getServiceHub().rag().getToolNames?.() ?? Promise.resolve([]),
+        ])
+
+        // Update MCP tools
+        updateTools(mcpTools)
+
+        const mcpNames = mcpTools.map((t) => t.name)
+        const mcpNameSet = new Set(mcpNames)
+        const ragOnly = ragToolNames.filter((n) => !mcpNameSet.has(n))
+        if (ragOnly.length !== ragToolNames.length) {
+          const shadowed = ragToolNames.filter((n) => mcpNameSet.has(n))
+          console.warn(
+            `[tools] RAG tool(s) shadowed by MCP and routed to MCP: ${shadowed.join(', ')}`
+          )
+        }
+        updateMcpToolNames(mcpNames)
+        updateRagToolNames(ragOnly)
+      } catch (error) {
+        console.error('Failed to fetch MCP tools:', error)
+      }
+    }
+    setTools()
+
+    let unsubscribe = () => {}
+    getServiceHub().events().listen(SystemEvent.MCP_UPDATE, setTools).then((unsub) => {
+      // Unsubscribe from the event when the component unmounts
+      unsubscribe = unsub
+    }).catch((error) => {
+      console.error('Failed to set up MCP update listener:', error)
+    })
+    return unsubscribe
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Contributed tools come and go as extensions bind and release handlers.
+  // Only the tool list is compared, so a status item update does not make
+  // the chat transport rebuild its tools.
+  useEffect(() => {
+    let previous = ''
+    const sync = (state: Parameters<typeof listExtensionTools>[0]) => {
+      const tools = listExtensionTools(state)
+      const key = JSON.stringify(tools)
+      if (key === previous) return
+      previous = key
+      updateExtensionTools(tools)
+    }
+    sync(useContributions.getState())
+    return useContributions.subscribe(sync)
+  }, [updateExtensionTools])
+}

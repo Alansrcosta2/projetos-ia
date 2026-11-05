@@ -1,0 +1,295 @@
+import { withPostHogConfig } from "@posthog/nextjs-config";
+import { withSentryConfig } from "@sentry/nextjs/config";
+
+// Allow Docker builds to skip source-map generation (halves memory usage).
+// Defaults to true so Vercel/local builds are unaffected.
+const enableSourceMaps = process.env.NEXT_PUBLIC_SOURCEMAPS !== "false";
+
+// CI's e2e image build skips lint and type checks; CI runs `pnpm lint` and
+// `pnpm types` as their own jobs.
+const skipBuildChecks = process.env.NEXT_SKIP_BUILD_CHECKS === "true";
+
+// Read by the React Compiler coverage test too, so both cover the same files.
+export const reactCompilerSources = [
+  "/src/app/(platform)/copilot/",
+  "/src/components/organisms/Conversation/",
+  "/src/components/organisms/Message/",
+  "/src/components/organisms/PromptInput/",
+];
+
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  // VERCEL_ENV and VERCEL_TARGET_ENV are server-only. Mirror them into the
+  // browser bundle so Sentry and PostHog can tag branch previews as previews
+  // rather than as production, and custom environments (the dev deployment's
+  // `staging`) as themselves.
+  env: {
+    NEXT_PUBLIC_VERCEL_ENV: process.env.VERCEL_ENV ?? "",
+    NEXT_PUBLIC_VERCEL_TARGET_ENV: process.env.VERCEL_TARGET_ENV ?? "",
+    // Sentry initialises in the browser too, so its kill switch must reach it.
+    DISABLE_SENTRY: process.env.DISABLE_SENTRY ?? "",
+    // The build's commit, which Sentry's plugin also names its release, so
+    // PostHog events can be split by deploy.
+    NEXT_PUBLIC_REVISION:
+      process.env.SENTRY_RELEASE || process.env.VERCEL_GIT_COMMIT_SHA || "",
+  },
+  // Suppress the "X-Powered-By: Next.js" header (framework fingerprinting).
+  poweredByHeader: false,
+  // PostHog's endpoints end in a slash (`/e/`, `/flags/`), so requests on the
+  // PostHog proxy path must reach middleware untouched. Middleware redoes the
+  // trailing-slash redirect for every other path (see src/middleware.ts).
+  skipTrailingSlashRedirect: true,
+  async rewrites() {
+    return [
+      {
+        source: "/api/store/submissions/media/:path*",
+        destination: "/api/proxy/api/store/submissions/media/:path*",
+      },
+      {
+        source: "/api/store/media/:path*",
+        destination: "/api/proxy/api/store/media/:path*",
+      },
+    ];
+  },
+  // These /profile pages have no page left for the layout's redirect to run on.
+  async redirects() {
+    return [
+      {
+        source: "/profile",
+        destination: "/settings/profile",
+        permanent: false,
+      },
+      {
+        source: "/profile/integrations",
+        destination: "/settings/integrations",
+        permanent: false,
+      },
+    ];
+  },
+  productionBrowserSourceMaps: enableSourceMaps,
+  eslint: { ignoreDuringBuilds: skipBuildChecks },
+  typescript: { ignoreBuildErrors: skipBuildChecks },
+  // Externalize OpenTelemetry packages to fix Turbopack HMR issues
+  serverExternalPackages: [
+    "@opentelemetry/instrumentation",
+    "@opentelemetry/sdk-node",
+    "import-in-the-middle",
+    "require-in-the-middle",
+  ],
+  experimental: {
+    serverActions: {
+      bodySizeLimit: "256mb",
+    },
+    middlewareClientMaxBodySize: "256mb",
+    // Limit parallel webpack workers to reduce peak memory during builds.
+    cpus: 2,
+    // The React Compiler memoises components and hooks it can prove follow
+    // React's rules. Copilot only for now; every other folder builds exactly
+    // as before. Plain strings, since Turbopack only takes serialisable
+    // loader options; the compiler matches them against each file's path.
+    reactCompiler: {
+      compilationMode: "infer",
+      sources: reactCompilerSources,
+    },
+  },
+  // Work around cssnano "Invalid array length" bug in Next.js's bundled
+  // cssnano-simple comment parser when processing very large CSS chunks.
+  // CSS is still bundled correctly; gzip handles most of the size savings anyway.
+  webpack: (config, { dev }) => {
+    if (!dev) {
+      // Next.js adds CssMinimizerPlugin internally (after user config), so we
+      // can't filter it from config.plugins. Instead, intercept the webpack
+      // compilation hooks and replace the buggy plugin's tap with a no-op.
+      config.plugins.push({
+        apply(compiler) {
+          compiler.hooks.compilation.tap(
+            "DisableCssMinimizer",
+            (compilation) => {
+              compilation.hooks.processAssets.intercept({
+                register: (tap) => {
+                  if (tap.name === "CssMinimizerPlugin") {
+                    return { ...tap, fn: async () => {} };
+                  }
+                  return tap;
+                },
+              });
+            },
+          );
+        },
+      });
+    }
+    return config;
+  },
+  images: {
+    domains: [
+      // We dont need to maintain alphabetical order here
+      // as we are doing logical grouping of domains
+      "images.unsplash.com",
+      "ddz4ak4pa3d19.cloudfront.net",
+      "upload.wikimedia.org",
+      "storage.googleapis.com",
+
+      "ideogram.ai", // for generated images
+      "example.com", // for local test data images
+    ],
+    remotePatterns: [
+      {
+        protocol: "https",
+        hostname: "storage.googleapis.com",
+        pathname: "/**",
+      },
+      {
+        protocol: "https",
+        hostname: "storage.cloud.google.com",
+        pathname: "/**",
+      },
+      {
+        protocol: "https",
+        hostname: "lh3.googleusercontent.com",
+        pathname: "/**",
+      },
+    ],
+  },
+  // Vercel has its own deployment mechanism and doesn't need standalone mode
+  ...(process.env.VERCEL ? {} : { output: "standalone" }),
+  transpilePackages: ["geist"],
+  // Baseline security response headers applied to every route. Defined here
+  // (rather than in the Sentry options) so they apply on all build paths.
+  // Self-hosted Next.js fonts are served with `Access-Control-Allow-Origin: *`.
+  // They are only loaded by our own (same-origin) pages, so scope CORS to our
+  // own origin instead of "*" to resolve the CASA "overly permissive CORS"
+  // finding without affecting how the fonts load.
+  async headers() {
+    return [
+      {
+        source: "/:path*",
+        headers: [
+          { key: "X-Content-Type-Options", value: "nosniff" },
+          { key: "X-Frame-Options", value: "SAMEORIGIN" },
+          // Modern equivalent of X-Frame-Options; browsers that support CSP
+          // use this and ignore the legacy header, so send both.
+          { key: "Content-Security-Policy", value: "frame-ancestors 'self'" },
+          {
+            key: "Referrer-Policy",
+            value: "strict-origin-when-cross-origin",
+          },
+          // Enables Sentry browser JS self-profiling.
+          { key: "Document-Policy", value: "js-profiling" },
+        ],
+      },
+      // Self-hosted Next.js fonts are served from `/_next/static/media/`.
+      // `Access-Control-Allow-Origin` only accepts a single value, so we use
+      // `has` matchers on the request `Origin` header to echo back the
+      // requesting origin when it belongs to one of our known deployments.
+      {
+        source: "/_next/static/media/:path*",
+        has: [
+          { type: "header", key: "Origin", value: "https://platform.agpt.co" },
+        ],
+        headers: [
+          {
+            key: "Access-Control-Allow-Origin",
+            value: "https://platform.agpt.co",
+          },
+        ],
+      },
+      {
+        source: "/_next/static/media/:path*",
+        has: [
+          {
+            type: "header",
+            key: "Origin",
+            value: "https://dev-builder.agpt.co",
+          },
+        ],
+        headers: [
+          {
+            key: "Access-Control-Allow-Origin",
+            value: "https://dev-builder.agpt.co",
+          },
+        ],
+      },
+    ];
+  },
+};
+
+// Only run the Sentry webpack plugin when we can actually upload source maps
+// (i.e. on Vercel with SENTRY_AUTH_TOKEN set). The Sentry *runtime* SDK
+// (imported in app code) still captures errors without the plugin.
+// Skipping the plugin saves ~1 GB of peak memory during `next build`.
+const skipSentryPlugin =
+  process.env.NODE_ENV !== "production" ||
+  !enableSourceMaps ||
+  !process.env.SENTRY_AUTH_TOKEN;
+
+const configWithSentry = skipSentryPlugin
+  ? nextConfig
+  : withSentryConfig(nextConfig, {
+      // For all available options, see:
+      // https://github.com/getsentry/sentry-webpack-plugin#options
+
+      org: "significant-gravitas",
+      project: process.env.SENTRY_PROJECT || "builder",
+
+      // Only print logs for uploading source maps in CI
+      silent: !process.env.CI,
+
+      // For all available options, see:
+      // https://docs.sentry.io/platforms/javascript/guides/nextjs/manual-setup/
+
+      // Upload a larger set of source maps for prettier stack traces (increases build time)
+      widenClientFileUpload: true,
+
+      // Automatically annotate React components to show their full name in breadcrumbs
+      reactComponentAnnotation: {
+        enabled: true,
+      },
+
+      // Browser Sentry envelopes use the tunnel in src/lib/sentry-tunnel.ts, relayed by src/middleware.ts.
+
+      // No need to hide source maps from generated client bundles
+      // since the source is public anyway :)
+      hideSourceMaps: false,
+
+      // This helps Sentry with sourcemaps... https://docs.sentry.io/platforms/javascript/guides/nextjs/sourcemaps/
+      sourcemaps: {
+        disable: !enableSourceMaps,
+        assets: [".next/**/*.js", ".next/**/*.js.map"],
+        ignore: ["**/node_modules/**"],
+        deleteSourcemapsAfterUpload: false, // Source is public anyway :)
+      },
+
+      webpack: {
+        // Automatically tree-shake Sentry logger statements to reduce bundle size
+        treeshake: { removeDebugLogging: true },
+
+        // Enables automatic instrumentation of Vercel Cron Monitors. (Does not yet work with App Router route handlers.)
+        // See the following for more information:
+        // https://docs.sentry.io/product/crons/
+        // https://vercel.com/docs/cron-jobs
+        automaticVercelMonitors: true,
+      },
+    });
+
+// Build-only credentials, never NEXT_PUBLIC_ and never in `env` above, so they
+// stay out of the browser bundle. Named apart from the backend's public
+// POSTHOG_API_KEY so the two keys can't be mixed up.
+const postHogUploadConfigured = Boolean(
+  process.env.NODE_ENV === "production" &&
+    enableSourceMaps &&
+    process.env.POSTHOG_SOURCEMAP_UPLOAD_KEY &&
+    process.env.POSTHOG_SOURCEMAP_PROJECT_ID,
+);
+
+export default postHogUploadConfigured
+  ? withPostHogConfig(configWithSentry, {
+      personalApiKey: process.env.POSTHOG_SOURCEMAP_UPLOAD_KEY,
+      projectId: process.env.POSTHOG_SOURCEMAP_PROJECT_ID,
+      host: process.env.NEXT_PUBLIC_POSTHOG_HOST,
+      sourcemaps: {
+        enabled: enableSourceMaps,
+        // Sentry also uploads these maps; neither plugin should delete them first.
+        deleteAfterUpload: false,
+      },
+    })
+  : configWithSentry;

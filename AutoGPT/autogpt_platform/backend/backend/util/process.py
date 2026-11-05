@@ -1,0 +1,222 @@
+import gc
+import logging
+import os
+import signal
+import sys
+import time
+from abc import ABC, abstractmethod
+from multiprocessing import Process, get_all_start_methods, set_start_method
+from typing import ClassVar, Optional
+
+from backend.util.feature_flag import initialize_feature_flags, shutdown_feature_flags
+from backend.util.logging import configure_logging
+from backend.util.metrics import sentry_init
+from backend.util.retry import stop_retry_loops
+from backend.util.secrets_guard import check_secrets
+from backend.util.service_auth import internal_api_key
+from backend.util.settings import (
+    AppEnvironment,
+    Config,
+    get_service_name,
+    set_service_name,
+)
+
+logger = logging.getLogger(__name__)
+
+config = Config()
+
+# How long ``AppProcess.stop`` waits for a child to act on a signal before
+# escalating. Long enough for an orderly shutdown, short enough that a wedged
+# child cannot hold the parent open indefinitely.
+STOP_TIMEOUT_SECONDS = 30
+
+
+class AppProcess(ABC):
+    """
+    A class to represent an object that can be executed in a background process.
+    """
+
+    process: Optional[Process] = None
+    _shutting_down: bool = False
+    _cleaned_up: bool = False
+    # Opens the flag vendor's client before `run`, so no read waits on its
+    # first load. A service that never reads a flag opts out.
+    reads_feature_flags: ClassVar[bool] = True
+
+    if "forkserver" in get_all_start_methods():
+        set_start_method("forkserver", force=True)
+    else:
+        logger.warning("Forkserver start method is not available. Using spawn instead.")
+        set_start_method("spawn", force=True)
+
+    configure_logging()
+    sentry_init()
+
+    # Methods that are executed INSIDE the process #
+
+    @abstractmethod
+    def run(self):
+        """
+        The method that will be executed in the process.
+        """
+        pass
+
+    @property
+    def service_name(self) -> str:
+        return self.__class__.__name__
+
+    def cleanup(self):
+        """
+        Implement this method on a subclass to do post-execution cleanup,
+        e.g. disconnecting from a database or terminating child processes.
+        """
+        pass
+
+    def execute_run_command(self, silent):
+        signal.signal(signal.SIGTERM, self._self_terminate)
+        signal.signal(signal.SIGINT, self._self_terminate)
+        # LOCAL has no vendor configured; its flags resolve to mock defaults.
+        start_flags = (
+            self.reads_feature_flags and config.app_env is not AppEnvironment.LOCAL
+        )
+
+        try:
+            if silent:
+                sys.stdout = open(os.devnull, "w")
+                sys.stderr = open(os.devnull, "w")
+
+            set_service_name(self.service_name)
+            logger.info(f"[{self.service_name}] Starting...")
+            if start_flags:
+                initialize_feature_flags()
+            self.run()
+        except BaseException as e:
+            logger.warning(
+                f"[{self.service_name}] 🛑 Terminating because of {type(e).__name__}: {e}",  # noqa
+                exc_info=e if not isinstance(e, SystemExit) else None,
+            )
+            # Send error to Sentry before cleanup
+            if not isinstance(e, (KeyboardInterrupt, SystemExit)):
+                try:
+                    from backend.util.metrics import sentry_capture_error
+
+                    sentry_capture_error(e)
+                except Exception:
+                    pass  # Silently ignore if Sentry isn't available
+        finally:
+            try:
+                if not self._cleaned_up:
+                    self._cleaned_up = True
+                    logger.info(f"[{self.service_name}] 🧹 Running cleanup")
+                    self.cleanup()
+                    logger.info(f"[{self.service_name}] ✅ Cleanup done")
+            finally:
+                # After cleanup, which can drain work that still reads flags.
+                if start_flags:
+                    shutdown_feature_flags()
+            logger.info(f"[{self.service_name}] 🛑 Terminated")
+
+    @staticmethod
+    def llprint(message: str):
+        """
+        Low-level print/log helper function for use in signal handlers.
+        Regular log/print statements are not allowed in signal handlers.
+        """
+        os.write(sys.stdout.fileno(), (message + "\n").encode())
+
+    def _self_terminate(self, signum: int, frame):
+        stop_retry_loops()
+        if not self._shutting_down:
+            self._shutting_down = True
+            sys.exit(0)
+        else:
+            self.llprint(
+                f"[{self.service_name}] Received exit signal {signum}, but cleanup is already underway."
+            )
+
+    # Methods that are executed OUTSIDE the process #
+
+    def __enter__(self):
+        self.start(background=True)
+        return self
+
+    def __exit__(self, *args, **kwargs):
+        self.stop()
+
+    def start(self, background: bool = False, silent: bool = False, **proc_args) -> int:
+        """
+        Start the background process.
+        Args:
+            background: Whether to run the process in the background.
+            silent: Whether to disable stdout and stderr.
+            proc_args: Additional arguments to pass to the process.
+        Returns:
+            the process id or 0 if the process is not running in the background.
+        """
+        # Startup guard: no service comes up on a missing or publicly-known
+        # secret. Deliberately here rather than at import time so tooling and
+        # tests that merely import backend modules are unaffected.
+        check_secrets()
+        # Raises on a malformed INTERNAL_API_KEY, or an ENCRYPTION_KEY the key
+        # cannot be derived from, here rather than inside get_service_client's
+        # connection retries, which would retry it for most of an hour.
+        internal_api_key()
+
+        if not background:
+            self.execute_run_command(silent)
+            return 0
+
+        self.process = Process(
+            name=self.__class__.__name__,
+            target=self.execute_run_command,
+            args=(silent,),
+            **proc_args,
+        )
+        self.process.start()
+        logger.info(f"[{self.service_name}] started with PID {self.process.pid}")
+
+        return self.process.pid or 0
+
+    def stop(self):
+        """
+        Stop the background process.
+
+        Both joins are bounded. An unbounded ``join()`` here wedges whoever is
+        shutting the service down when the child does not act on the SIGTERM —
+        in a test session that is the session fixture's teardown, so the run
+        finishes every test and then never prints its summary line.
+        """
+        if not self.process:
+            return
+
+        pid = self.process.pid
+        self.process.terminate()
+        self.process.join(timeout=STOP_TIMEOUT_SECONDS)
+
+        if self.process.is_alive():
+            logger.warning(
+                f"[{self.service_name}] with PID {pid} ignored SIGTERM "
+                f"for {STOP_TIMEOUT_SECONDS}s; killing it"
+            )
+            self.process.kill()
+            self.process.join(timeout=STOP_TIMEOUT_SECONDS)
+
+        logger.info(f"[{self.service_name}] with PID {pid} stopped")
+        self.process = None
+
+
+def freeze_startup_heap() -> None:
+    """Exempt every object alive now from later full garbage collections.
+
+    Call once startup is done. A full collection walks every tracked object
+    with the GIL held, and the ~2M the block registry leaves stopped all
+    threads for ~0.5 s each time, and for seconds on a swapping CI runner.
+    """
+    started = time.monotonic()
+    # Collect first: garbage still in the heap would otherwise be frozen in place.
+    gc.collect()
+    gc.freeze()
+    logger.info(
+        f"[{get_service_name()}] Froze {gc.get_freeze_count()} startup objects "
+        f"out of full garbage collections in {time.monotonic() - started:.1f}s"
+    )

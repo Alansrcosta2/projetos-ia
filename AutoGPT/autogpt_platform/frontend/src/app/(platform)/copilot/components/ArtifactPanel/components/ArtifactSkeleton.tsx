@@ -1,0 +1,17 @@
+import { Skeleton } from "@/components/atoms/Skeleton/Skeleton";
+
+interface Props {
+  /** Extra line before the 32h block (the variant used while fetching text). */
+  extraLine?: boolean;
+}
+
+export function ArtifactSkeleton({ extraLine }: Props) {
+  return (
+    <div className="space-y-3 p-4">
+      <Skeleton variant="translucent" className="h-4 w-3/4" />
+      <Skeleton variant="translucent" className="h-4 w-1/2" />
+      {extraLine && <Skeleton variant="translucent" className="h-4 w-5/6" />}
+      <Skeleton variant="translucent" className="h-32 w-full" />
+    </div>
+  );
+}

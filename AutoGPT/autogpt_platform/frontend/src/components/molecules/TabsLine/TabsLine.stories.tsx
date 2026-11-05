@@ -1,0 +1,349 @@
+import type { Meta, StoryObj } from "@storybook/nextjs";
+import {
+  Briefcase01Icon,
+  Calendar03Icon,
+  SparklesIcon,
+  UserIcon,
+} from "@hugeicons/core-free-icons";
+import {
+  TabsLine,
+  TabsLineContent,
+  TabsLineList,
+  TabsLineTrigger,
+} from "./TabsLine";
+import { Text } from "@/components/atoms/Text/Text";
+
+const meta = {
+  title: "Molecules/TabsLine",
+  component: TabsLine,
+  parameters: {
+    layout: "fullscreen",
+  },
+  tags: ["autodocs"],
+} satisfies Meta<typeof TabsLine>;
+
+export default meta;
+type Story = StoryObj<typeof meta>;
+
+// Helper component to demonstrate tabs functionality
+function TabsDemo() {
+  return (
+    <div className="flex flex-col gap-8 p-8">
+      <h2 className="text-heading-md font-bold">TabsLine Examples</h2>
+
+      <div className="space-y-6">
+        <div>
+          <h3 className="mb-4 text-lead font-semibold">Basic Tabs</h3>
+          <TabsLine defaultValue="tab1" className="w-full">
+            <TabsLineList>
+              <TabsLineTrigger value="tab1">Account</TabsLineTrigger>
+              <TabsLineTrigger value="tab2">Password</TabsLineTrigger>
+              <TabsLineTrigger value="tab3">Settings</TabsLineTrigger>
+            </TabsLineList>
+            <TabsLineContent value="tab1">
+              <div className="p-4 text-body">
+                Make changes to your account here. Click save when you&apos;re
+                done.
+              </div>
+            </TabsLineContent>
+            <TabsLineContent value="tab2">
+              <div className="p-4 text-body">
+                Change your password here. After saving, you&apos;ll be logged
+                out.
+              </div>
+            </TabsLineContent>
+            <TabsLineContent value="tab3">
+              <div className="p-4 text-body">
+                Update your preferences and settings here.
+              </div>
+            </TabsLineContent>
+          </TabsLine>
+        </div>
+
+        <div>
+          <h3 className="mb-4 text-lead font-semibold">Many Tabs</h3>
+          <TabsLine defaultValue="overview" className="w-full">
+            <TabsLineList>
+              <TabsLineTrigger value="overview">Overview</TabsLineTrigger>
+              <TabsLineTrigger value="analytics">Analytics</TabsLineTrigger>
+              <TabsLineTrigger value="reports">Reports</TabsLineTrigger>
+              <TabsLineTrigger value="notifications">
+                Notifications
+              </TabsLineTrigger>
+              <TabsLineTrigger value="integrations">
+                Integrations
+              </TabsLineTrigger>
+              <TabsLineTrigger value="billing">Billing</TabsLineTrigger>
+            </TabsLineList>
+            <TabsLineContent value="overview">
+              <div className="p-4 text-body">
+                Dashboard overview with key metrics and recent activity.
+              </div>
+            </TabsLineContent>
+            <TabsLineContent value="analytics">
+              <div className="p-4 text-body">
+                Detailed analytics and performance metrics.
+              </div>
+            </TabsLineContent>
+            <TabsLineContent value="reports">
+              <div className="p-4 text-body">
+                Generate and view reports for your account.
+              </div>
+            </TabsLineContent>
+            <TabsLineContent value="notifications">
+              <div className="p-4 text-body">
+                Manage your notification preferences.
+              </div>
+            </TabsLineContent>
+            <TabsLineContent value="integrations">
+              <div className="p-4 text-body">
+                Connect and manage third-party integrations.
+              </div>
+            </TabsLineContent>
+            <TabsLineContent value="billing">
+              <div className="p-4 text-body">
+                View and manage your billing information.
+              </div>
+            </TabsLineContent>
+          </TabsLine>
+        </div>
+
+        <div>
+          <h3 className="mb-4 text-lead font-semibold">Disabled Tab</h3>
+          <TabsLine defaultValue="active1" className="w-full">
+            <TabsLineList>
+              <TabsLineTrigger value="active1">Active Tab</TabsLineTrigger>
+              <TabsLineTrigger value="disabled" disabled>
+                Disabled Tab
+              </TabsLineTrigger>
+              <TabsLineTrigger value="active2">Another Active</TabsLineTrigger>
+            </TabsLineList>
+            <TabsLineContent value="active1">
+              <div className="p-4 text-body">
+                This is an active tab that you can interact with.
+              </div>
+            </TabsLineContent>
+            <TabsLineContent value="disabled">
+              <div className="p-4 text-body">
+                This content is for the disabled tab.
+              </div>
+            </TabsLineContent>
+            <TabsLineContent value="active2">
+              <div className="p-4 text-body">
+                Another active tab with different content.
+              </div>
+            </TabsLineContent>
+          </TabsLine>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export const Default: Story = {
+  render: () => <TabsDemo />,
+};
+
+export const BasicTabs: Story = {
+  render: () => (
+    <div className="p-8">
+      <TabsLine defaultValue="account" className="w-[400px]">
+        <TabsLineList>
+          <TabsLineTrigger value="account">Account</TabsLineTrigger>
+          <TabsLineTrigger value="password">Password</TabsLineTrigger>
+        </TabsLineList>
+        <TabsLineContent value="account">
+          <div className="p-4 text-body">
+            Make changes to your account here. Click save when you&apos;re done.
+          </div>
+        </TabsLineContent>
+        <TabsLineContent value="password">
+          <div className="p-4 text-body">
+            Change your password here. After saving, you&apos;ll be logged out.
+          </div>
+        </TabsLineContent>
+      </TabsLine>
+    </div>
+  ),
+};
+
+export const ManyTabs: Story = {
+  render: () => (
+    <div className="p-8">
+      <TabsLine defaultValue="home" className="w-full">
+        <TabsLineList>
+          <TabsLineTrigger value="home">Home</TabsLineTrigger>
+          <TabsLineTrigger value="about">About</TabsLineTrigger>
+          <TabsLineTrigger value="services">Services</TabsLineTrigger>
+          <TabsLineTrigger value="portfolio">Portfolio</TabsLineTrigger>
+          <TabsLineTrigger value="contact">Contact</TabsLineTrigger>
+          <TabsLineTrigger value="blog">Blog</TabsLineTrigger>
+        </TabsLineList>
+        <TabsLineContent value="home">
+          <div className="p-4 text-body">Welcome to our homepage!</div>
+        </TabsLineContent>
+        <TabsLineContent value="about">
+          <div className="p-4 text-body">Learn more about our company.</div>
+        </TabsLineContent>
+        <TabsLineContent value="services">
+          <div className="p-4 text-body">Discover our range of services.</div>
+        </TabsLineContent>
+        <TabsLineContent value="portfolio">
+          <div className="p-4 text-body">
+            View our previous work and projects.
+          </div>
+        </TabsLineContent>
+        <TabsLineContent value="contact">
+          <div className="p-4 text-body">Get in touch with us today.</div>
+        </TabsLineContent>
+        <TabsLineContent value="blog">
+          <div className="p-4 text-body">Read our latest blog posts.</div>
+        </TabsLineContent>
+      </TabsLine>
+    </div>
+  ),
+};
+
+export const WithDisabledTab: Story = {
+  render: () => (
+    <div className="p-8">
+      <TabsLine defaultValue="available" className="w-[400px]">
+        <TabsLineList>
+          <TabsLineTrigger value="available">Available</TabsLineTrigger>
+          <TabsLineTrigger value="disabled" disabled>
+            Disabled
+          </TabsLineTrigger>
+          <TabsLineTrigger value="enabled">Enabled</TabsLineTrigger>
+        </TabsLineList>
+        <TabsLineContent value="available">
+          <div className="p-4 text-body">
+            This tab is available and can be clicked.
+          </div>
+        </TabsLineContent>
+        <TabsLineContent value="disabled">
+          <div className="p-4 text-body">
+            This tab is disabled and cannot be accessed.
+          </div>
+        </TabsLineContent>
+        <TabsLineContent value="enabled">
+          <div className="p-4 text-body">
+            This tab is also enabled and functional.
+          </div>
+        </TabsLineContent>
+      </TabsLine>
+    </div>
+  ),
+};
+
+export const FullWidth: Story = {
+  render: () => (
+    <div className="p-8">
+      <TabsLine defaultValue="tab1" className="w-full">
+        <TabsLineList className="grid w-full grid-cols-3">
+          <TabsLineTrigger value="tab1">Tab One</TabsLineTrigger>
+          <TabsLineTrigger value="tab2">Tab Two</TabsLineTrigger>
+          <TabsLineTrigger value="tab3">Tab Three</TabsLineTrigger>
+        </TabsLineList>
+        <TabsLineContent value="tab1">
+          <div className="p-4 text-body">
+            Content for the first tab with full width layout.
+          </div>
+        </TabsLineContent>
+        <TabsLineContent value="tab2">
+          <div className="p-4 text-body">
+            Content for the second tab with full width layout.
+          </div>
+        </TabsLineContent>
+        <TabsLineContent value="tab3">
+          <div className="p-4 text-body">
+            Content for the third tab with full width layout.
+          </div>
+        </TabsLineContent>
+      </TabsLine>
+    </div>
+  ),
+};
+
+function CompactDemo() {
+  return (
+    <div className="p-8">
+      <TabsLine variant="compact" defaultValue="basics" className="w-full">
+        <TabsLineList className="overflow-x-auto">
+          <TabsLineTrigger value="basics" icon={UserIcon}>
+            Basics
+          </TabsLineTrigger>
+          <TabsLineTrigger value="work" icon={Briefcase01Icon}>
+            Work
+          </TabsLineTrigger>
+          <TabsLineTrigger value="schedules" icon={Calendar03Icon}>
+            Schedules
+          </TabsLineTrigger>
+          <TabsLineTrigger value="skills" icon={SparklesIcon}>
+            Skills
+          </TabsLineTrigger>
+        </TabsLineList>
+        <TabsLineContent value="basics">
+          <div className="text-body text-foreground-secondary">
+            Basics panel
+          </div>
+        </TabsLineContent>
+        <TabsLineContent value="work">
+          <div className="text-body text-foreground-secondary">Work panel</div>
+        </TabsLineContent>
+        <TabsLineContent value="schedules">
+          <div className="text-body text-foreground-secondary">
+            Schedules panel
+          </div>
+        </TabsLineContent>
+        <TabsLineContent value="skills">
+          <div className="text-body text-foreground-secondary">
+            Skills panel
+          </div>
+        </TabsLineContent>
+      </TabsLine>
+    </div>
+  );
+}
+
+export const Compact: Story = {
+  render: () => <CompactDemo />,
+  parameters: {
+    docs: {
+      description: {
+        story:
+          '`variant="compact"` is the dense neutral style used on Team pages: flush, zinc underline, 14px triggers. Pass `icon` on a trigger for a 14px Hugeicon.',
+      },
+    },
+  },
+};
+
+export const Pill: Story = {
+  render: () => (
+    <div className="p-8">
+      <TabsLine
+        variant="pill"
+        defaultValue="top-up"
+        className="flex w-[400px] flex-col items-center"
+      >
+        <TabsLineList className="mx-auto">
+          <TabsLineTrigger value="top-up">One-time top up</TabsLineTrigger>
+          <TabsLineTrigger value="auto-refill">Auto-refill</TabsLineTrigger>
+        </TabsLineList>
+        <TabsLineContent value="top-up">
+          <Text variant="body">Add credits once.</Text>
+        </TabsLineContent>
+        <TabsLineContent value="auto-refill">
+          <Text variant="body">Top up whenever the balance runs low.</Text>
+        </TabsLineContent>
+      </TabsLine>
+    </div>
+  ),
+  parameters: {
+    docs: {
+      description: {
+        story:
+          '`variant="pill"` is a segmented control: the triggers sit in a rounded grey track and the active one is raised on a light chip, with no underline. Used by the wallet\'s top-up panel.',
+      },
+    },
+  },
+};

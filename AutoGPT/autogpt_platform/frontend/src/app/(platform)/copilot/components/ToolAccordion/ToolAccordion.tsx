@@ -1,0 +1,108 @@
+"use client";
+
+import { cn } from "@/lib/utils";
+import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
+import { useId } from "react";
+import { useToolAccordion } from "./useToolAccordion";
+import { ArrowDown01Icon } from "@hugeicons/core-free-icons";
+import { Icon } from "@/components/atoms/Icon/Icon";
+import { Text } from "@/components/atoms/Text/Text";
+
+interface Props {
+  icon: React.ReactNode;
+  title: React.ReactNode;
+  titleClassName?: string;
+  description?: React.ReactNode;
+  children: React.ReactNode;
+  className?: string;
+  defaultExpanded?: boolean;
+  expanded?: boolean;
+  onExpandedChange?: (expanded: boolean) => void;
+}
+
+export function ToolAccordion({
+  icon,
+  title,
+  titleClassName,
+  description,
+  children,
+  className,
+  defaultExpanded,
+  expanded,
+  onExpandedChange,
+}: Props) {
+  const shouldReduceMotion = useReducedMotion();
+  const contentId = useId();
+  const { isExpanded, toggle } = useToolAccordion({
+    expanded,
+    defaultExpanded,
+    onExpandedChange,
+  });
+
+  return (
+    <div
+      className={cn(
+        "mt-2 w-full rounded-xl border border-border-base/70 bg-surface px-3 py-2 shadow-sm",
+        "duration-500 animate-in fade-in fill-mode-both slide-in-from-bottom-2",
+        className,
+      )}
+    >
+      <button
+        type="button"
+        aria-expanded={isExpanded}
+        aria-controls={contentId}
+        onClick={toggle}
+        className="flex w-full items-center justify-between gap-3 py-1 text-left"
+      >
+        <div className="flex min-w-0 items-center gap-3">
+          <span className="flex shrink-0 items-center text-foreground-emphasis">
+            {icon}
+          </span>
+          <div className="min-w-0">
+            <p
+              className={cn(
+                "truncate text-body font-medium text-foreground-emphasis",
+                titleClassName,
+              )}
+            >
+              {title}
+            </p>
+            {description && (
+              <Text variant="small-tight" tone="body" className="truncate">
+                {description}
+              </Text>
+            )}
+          </div>
+        </div>
+        <Icon
+          icon={ArrowDown01Icon}
+          tone="muted"
+          motion="transform"
+          className={cn("h-4 w-4 shrink-0", isExpanded && "rotate-180")}
+        />
+      </button>
+
+      <AnimatePresence initial={false}>
+        {isExpanded && (
+          <motion.div
+            id={contentId}
+            initial={{ height: 0, opacity: 0, filter: "blur(4px)" }}
+            animate={{ height: "auto", opacity: 1, filter: "blur(0px)" }}
+            exit={{ height: 0, opacity: 0, filter: "blur(4px)" }}
+            transition={
+              shouldReduceMotion
+                ? { duration: 0 }
+                : { duration: 0.4, ease: [0.16, 1, 0.3, 1] }
+            }
+            className="overflow-hidden"
+            style={{ willChange: "height, opacity, filter" }}
+          >
+            <div className="max-h-[24rem] overflow-y-auto pt-3 pb-2">
+              {children}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}

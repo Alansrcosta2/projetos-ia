@@ -1,0 +1,72 @@
+import { cn } from "@/lib/utils";
+import React from "react";
+import { BaseInput } from "@/components/atoms/Input/BaseInput";
+import { useBlockMenuSearchBar } from "./useBlockMenuSearchBar";
+import { Button } from "@/components/atoms/Button/Button";
+import { Cancel01Icon, Search01Icon } from "@hugeicons/core-free-icons";
+import { Icon } from "@/components/atoms/Icon/Icon";
+
+interface BlockMenuSearchBarProps {
+  className?: string;
+}
+
+export const BlockMenuSearchBar: React.FC<BlockMenuSearchBarProps> = ({
+  className = "",
+}) => {
+  const {
+    handleClear,
+    inputRef,
+    localQuery,
+    setLocalQuery,
+    debouncedSetSearchQuery,
+  } = useBlockMenuSearchBar();
+
+  return (
+    <div
+      data-id="blocks-control-search-bar"
+      className={cn(
+        "flex min-h-[3.5625rem] items-center gap-2.5 px-4",
+        className,
+      )}
+    >
+      <div className="flex h-6 w-6 items-center justify-center">
+        <Icon
+          icon={Search01Icon}
+          tone="body"
+          className="h-6 w-6"
+          strokeWidth={2}
+        />
+      </div>
+      <BaseInput
+        ref={inputRef}
+        type="text"
+        value={localQuery}
+        onChange={(e) => {
+          setLocalQuery(e.target.value);
+          debouncedSetSearchQuery(e.target.value);
+        }}
+        placeholder={"Blocks, Workflows, Integrations or Keywords..."}
+        className={cn(
+          "m-0 border-none p-0 font-sans text-body-lg leading-6 font-normal text-foreground-emphasis shadow-none outline-none",
+          "placeholder:text-foreground-subtle focus:shadow-none focus:ring-0 focus:outline-none",
+        )}
+      />
+      {localQuery.length > 0 && (
+        <Button
+          variant="ghost"
+          size="icon-xs"
+          aria-label="Clear search"
+          withTooltip={false}
+          onClick={handleClear}
+        >
+          <Icon
+            icon={Cancel01Icon}
+            tone="body"
+            className="h-6 w-6"
+            strokeWidth={2}
+          />
+        </Button>
+      )}
+    </div>
+  );
+};
