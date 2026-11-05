@@ -93,6 +93,14 @@ Ao iniciar um projeto, procure a categoria da tarefa e escolha a ferramenta. Exe
 |---|---|---|---|
 | Presenton | `presenton` | https://github.com/presenton/presenton | Apresentação inteira com IA a partir de um tema ou documento. |
 
+## Claude-100 (EGM do Google)
+
+| Item | Pasta | Repositório | Para que serve |
+|---|---|---|---|
+| EGM (Elephant Goldfish Model) | `elephant-goldfish-model` | https://github.com/google/elephant-goldfish-model | Faz o agente de IA escrever um plano e revisá-lo antes de programar. |
+
+> Resumo do material: `MATERIAIS/claude-100-egm.md`.
+
 ## Resumo por tarefa
 
 | Tarefa | Ferramentas |
@@ -108,3 +116,4 @@ Ao iniciar um projeto, procure a categoria da tarefa e escolha a ferramenta. Exe
 | Música e separação de faixas | `audiocraft`, `ultimatevocalremovergui` |
 | Automação / agentes | `n8n`, `dify`, `flowise`, `lobehub`, `AutoGPT`, `cline`, `OpenHands`, `openinterpreter` |
 | Apresentação | `presenton` |
+| Planejar antes de programar | `elephant-goldfish-model` (claude-100) |
