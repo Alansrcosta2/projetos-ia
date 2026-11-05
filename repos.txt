@@ -47,3 +47,4 @@ suno-ai/bark
 coqui-ai/TTS
 facebookresearch/segment-anything
 harry0703/MoneyPrinterTurbo
+google/elephant-goldfish-model

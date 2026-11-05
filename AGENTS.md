@@ -1,8 +1,8 @@
 # AGENTS.md — Instruções para agentes de IA
 
-Este repositório é um acervo de **49 projetos de IA de código aberto**, organizados
-em **uma pasta por projeto**, mantidos como snapshot do código (sem o histórico Git
-original de cada projeto).
+Este repositório é um acervo de **49 projetos de IA de código aberto** mais o
+**EGM do Google** (material claude-100), organizados em **uma pasta por projeto**,
+mantidos como snapshot do código (sem o histórico Git original de cada projeto).
 
 ## Estrutura
 
@@ -15,6 +15,7 @@ original de cada projeto).
 | `repos.txt` | Lista `owner/repo` com a origem de cada pasta |
 | `montar_repo.sh` | Script usado para montar este repositório |
 | `<NomeDoProjeto>/` | Código-fonte de cada um dos 49 projetos |
+| `elephant-goldfish-model/` | Código do EGM (claude-100) |
 
 ## Regras para a IA
 

@@ -77,3 +77,4 @@ Repositório único (a ser criado): https://github.com/Alansrcosta2/projetos-ia
 |---|---|
 | Repositório do EGM | https://github.com/google/elephant-goldfish-model |
 | Resumo local | `MATERIAIS/claude-100-egm.md` |
+| Código local | `elephant-goldfish-model/` |
