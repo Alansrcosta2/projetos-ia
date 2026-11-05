@@ -16,6 +16,7 @@ Repositório único que reúne, em pastas separadas, os 49 projetos de IA de có
 | `repos.txt` | Lista `owner/repo` usada pelo script |
 | `INSTRUCOES.md` | Passo a passo para publicar pelo servidor |
 | `montar_repo.sh` | Script que clona, monta e envia tudo para o GitHub |
+| `COMO_USAR_COM_IA.md` | Guia de como qualquer IA pode usar este material |
 | `elephant-goldfish-model/` | Código do EGM (claude-100), incluído além dos 49 projetos |
 
 ## Estrutura final no GitHub

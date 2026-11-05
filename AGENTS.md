@@ -13,6 +13,7 @@ mantidos como snapshot do código (sem o histórico Git original de cada projeto
 | `LINKS.md` | Links dos materiais de origem e dos repositórios no GitHub |
 | `MATERIAIS/` | Resumos dos materiais de origem (ex.: claude-100-egm.md) |
 | `repos.txt` | Lista `owner/repo` com a origem de cada pasta |
+| `COMO_USAR_COM_IA.md` | Guia de uso do material por agentes de IA |
 | `montar_repo.sh` | Script usado para montar este repositório |
 | `<NomeDoProjeto>/` | Código-fonte de cada um dos 49 projetos |
 | `elephant-goldfish-model/` | Código do EGM (claude-100) |
