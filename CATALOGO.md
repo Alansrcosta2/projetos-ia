@@ -1,8 +1,9 @@
 # Catálogo de IA — projetos-ia
 
-> 49 repositórios do GitHub clonados em `C:\Users\Alan Costa\Documents\projetos-ia` (fontes: mapa-100 e mapa-101 do André Lug).
-> Clones rasos (`--depth 1`): contêm só a versão mais recente. Atualizar com `git -C <pasta> pull`.
+> 49 repositórios do GitHub organizados em uma pasta por projeto neste repositório (fontes: mapa-100 e mapa-101 do André Lug).
+> São snapshots do código (sem o `.git` de cada projeto): contêm a versão mais recente no momento da montagem. Para atualizar um projeto, clone novamente o repositório original indicado em `LINKS.md`.
 > Os repositórios **não incluem os modelos de IA** — baixe-os na primeira execução de cada ferramenta.
+> Além dos 49, o repositório inclui o **EGM do Google** (claude-100) em `elephant-goldfish-model/`.
 
 ## Como usar este catálogo
 
